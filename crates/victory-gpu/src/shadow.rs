@@ -463,9 +463,11 @@ impl Shadow {
         let mut title = vec![0u8; n];
         let read = crate::host::read_into(from as *const u8, &mut title);
         #[cfg(test)]
-        tests::run_after_marked_read();
+        tests::marked_copy_back_at(tests::MarkedAt::Read);
         // Our own write below must not save the page for this copy again.
         let finished = t.finish(page / PAGE);
+        #[cfg(test)]
+        tests::marked_copy_back_at(tests::MarkedAt::Finished);
         if !read {
             return 0;
         }
@@ -1622,67 +1624,86 @@ pub(crate) mod tests {
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
     }
 
+    /// Points inside [`Shadow::copy_back_marked`] where a test runs a title
+    /// write, on this thread.
+    #[derive(Clone, Copy, PartialEq)]
+    pub(super) enum MarkedAt {
+        /// The page was read, still armed: the write saves its bytes first.
+        Read,
+        /// The copy-back asked what the title did: the write is after that.
+        Finished,
+    }
+
+    /// A title write a test runs inside the copy-back.
+    type TitleWrite = Box<dyn FnOnce()>;
+
     thread_local! {
-        /// Run inside [`Shadow::copy_back_marked`] right after it read the
-        /// page: a title write landing there, on this thread, at a known
-        /// point.
-        static AFTER_MARKED_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        static MARKED_HOOK: std::cell::RefCell<Option<(MarkedAt, TitleWrite)>> =
             const { std::cell::RefCell::new(None) };
     }
 
-    pub(super) fn run_after_marked_read() {
-        if let Some(hook) = AFTER_MARKED_READ.with(|h| h.borrow_mut().take()) {
-            hook();
+    pub(super) fn marked_copy_back_at(at: MarkedAt) {
+        let hook = MARKED_HOOK.with(|h| {
+            let mut h = h.borrow_mut();
+            if h.as_ref().is_some_and(|(when, _)| *when == at) { h.take() } else { None }
+        });
+        if let Some((_, f)) = hook {
+            f();
         }
     }
 
-    /// A title write to a marked page while its copy-back runs (after the
-    /// copy-back read it, before it wrote) stays: only the bytes the shader
-    /// changed go back. Writing the copy's whole page put its older bytes
-    /// back over the title's (a fence list read as -1).
+    /// A title write to a marked page while its copy-back runs stays: only
+    /// the bytes the shader changed go back, whether the write landed while
+    /// the page was armed (its bytes from before saved) or after the
+    /// copy-back asked (not saved: what the copy-back read tells). Writing
+    /// the copy's whole page put its older bytes back over the title's (a
+    /// fence list read as -1).
     #[test]
     fn marked_copy_back_keeps_a_title_write_made_meanwhile() {
-        let p = crate::watch::tests::pool(1);
-        let len = PAGE;
-        let title = move |at: usize| (p + at) as *mut u8;
-        // SAFETY: (title writes and reads below) bytes of our pool.
-        unsafe {
-            for i in 0..4 {
-                title(200 + i).write_volatile(0xff);
+        for at in [MarkedAt::Read, MarkedAt::Finished] {
+            let p = crate::watch::tests::pool(1);
+            let len = PAGE;
+            let title = move |at: usize| (p + at) as *mut u8;
+            // SAFETY: (title writes and reads below) bytes of our pool.
+            unsafe {
+                for i in 0..4 {
+                    title(200 + i).write_volatile(0xff);
+                }
             }
-        }
-        register(p, p as u64, len as u64);
-        let Some(copy) = find(p as u64, len as u64) else {
-            unregister(p, p as u64);
-            crate::watch::tests::free(p);
-            return; // no host GPU here
-        };
-        copy.update(p, len);
-        copy.writing(p, len, true);
-        // The shader writes at 16; the copy still holds -1 at 200.
-        copy.write_host((p + 16) as u64, &[0xaa, 0xbb, 0xcc, 0xdd]);
-        AFTER_MARKED_READ.with(|h| {
-            *h.borrow_mut() = Some(Box::new(move || {
+            register(p, p as u64, len as u64);
+            let Some(copy) = find(p as u64, len as u64) else {
+                unregister(p, p as u64);
+                crate::watch::tests::free(p);
+                return; // no host GPU here
+            };
+            copy.update(p, len);
+            copy.writing(p, len, true);
+            // The shader writes at 16; the copy still holds -1 at 200.
+            copy.write_host((p + 16) as u64, &[0xaa, 0xbb, 0xcc, 0xdd]);
+            let write = move || {
                 for (i, b) in [0x11u8, 0x22, 0x33, 0x44].into_iter().enumerate() {
                     // SAFETY: our pool, guarded: the handler opens the page.
                     unsafe { title(200 + i).write_volatile(b) };
                 }
-            }));
-        });
-        let written = copy.copy_back_marked(p);
-        let hook_ran = AFTER_MARKED_READ.with(|h| h.borrow_mut().take()).is_none();
-        // SAFETY: as above.
-        let read = |at: usize| [0, 1, 2, 3].map(|i| unsafe { title(at + i).read_volatile() });
-        let (gpu, title_bytes) = (read(16), read(200));
-        let host = copy.read_host((p + 200) as u64, 1);
-        copy.copy_back(p, len);
-        unregister(p, p as u64);
-        drop(copy);
-        crate::watch::tests::free(p);
-        assert!(hook_ran, "the title write ran inside the copy-back");
-        assert_eq!(written, 4, "the shader's bytes alone go back");
-        assert_eq!(gpu, [0xaa, 0xbb, 0xcc, 0xdd], "the shader's bytes");
-        assert_eq!(title_bytes, [0x11, 0x22, 0x33, 0x44], "the title's write stays");
-        assert_eq!(host, [0x4433_2211], "the copy takes the title's bytes");
+            };
+            MARKED_HOOK.with(|h| *h.borrow_mut() = Some((at, Box::new(write))));
+            let written = copy.copy_back_marked(p);
+            let hook_ran = MARKED_HOOK.with(|h| h.borrow_mut().take()).is_none();
+            // SAFETY: as above.
+            let read = |at: usize| [0, 1, 2, 3].map(|i| unsafe { title(at + i).read_volatile() });
+            let (gpu, title_bytes) = (read(16), read(200));
+            let host = copy.read_host((p + 200) as u64, 1);
+            copy.copy_back(p, len);
+            unregister(p, p as u64);
+            // The pages stay allocated (as the other tests' pools): a copy
+            // some page table still holds must not name memory reused
+            // meanwhile.
+            let at = if at == MarkedAt::Read { "while armed" } else { "after the copy-back asked" };
+            assert!(hook_ran, "{at}: the title write ran inside the copy-back");
+            assert_eq!(written, 4, "{at}: the shader's bytes alone go back");
+            assert_eq!(gpu, [0xaa, 0xbb, 0xcc, 0xdd], "{at}: the shader's bytes");
+            assert_eq!(title_bytes, [0x11, 0x22, 0x33, 0x44], "{at}: the title's write stays");
+            assert_eq!(host, [0x4433_2211], "{at}: the copy takes the title's bytes");
+        }
     }
 }
