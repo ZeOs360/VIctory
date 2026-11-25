@@ -2706,31 +2706,97 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    if readback { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_GENERIC_READ },
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
+        let state =
+            if readback { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_GENERIC_READ };
+        // Upload memory is only written by the CPU: in video memory it
+        // costs nothing more (readback memory is read, and stays).
+        match self.mapped_committed(&heap, &desc, state, !readback) {
+            Ok(made) => Some(made),
             Err(e) => {
                 tracing::warn!(error = %e, size, readback, "no mapped buffer");
                 None
             }
         }
+    }
+
+    /// Makes and maps a buffer in `heap`. Where system memory for the GPU
+    /// is full (Windows gives the GPU about half of the RAM, whatever the
+    /// page file) and `or_video` allows it, in video memory the CPU maps (a
+    /// GPU upload heap, where the host has one) instead: a full system
+    /// memory failed every allocation after it, and the title stopped soon
+    /// after. CPU reads of video memory are slow.
+    fn mapped_committed(
+        &self,
+        heap: &D3D12_HEAP_PROPERTIES,
+        desc: &D3D12_RESOURCE_DESC,
+        state: D3D12_RESOURCE_STATES,
+        or_video: bool,
+    ) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
+        let make = |heap: &D3D12_HEAP_PROPERTIES| -> windows::core::Result<(ID3D12Resource, *mut u8)> {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of a CPU-visible buffer.
+            unsafe {
+                self.device.CreateCommittedResource(
+                    heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    desc,
+                    state,
+                    None,
+                    &mut buffer,
+                )?;
+                let b = buffer.ok_or_else(windows::core::Error::empty)?;
+                b.Map(0, None, Some(&mut data))?;
+                Ok((b, data.cast::<u8>()))
+            }
+        };
+        #[cfg(test)]
+        let first = if memory_fallback::FULL.get() {
+            Err(windows::core::HRESULT(crate::object::E_OUTOFMEMORY).into())
+        } else {
+            make(heap)
+        };
+        #[cfg(not(test))]
+        let first = make(heap);
+        let full = match first {
+            Err(e) if e.code().0 == crate::object::E_OUTOFMEMORY => e,
+            made => return made,
+        };
+        if !or_video || heap.Type == D3D12_HEAP_TYPE_GPU_UPLOAD || !self.gpu_upload_heap() {
+            return Err(full);
+        }
+        let made = make(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() })?;
+        static PLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = PLACED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(
+                buffers = n,
+                size = desc.Width,
+                "system memory for the GPU is full: buffers go to video memory the CPU maps"
+            );
+        }
+        Ok(made)
+    }
+
+    /// Whether the host GPU has video memory the CPU maps (a GPU upload
+    /// heap: Resizable BAR, and a runtime that offers it).
+    fn gpu_upload_heap(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok()
+                && options.GPUUploadHeapSupported.as_bool();
+            tracing::info!(supported = ok, "GPU upload heap (video memory the CPU maps)");
+            ok
+        })
     }
 }
 
@@ -3160,17 +3226,7 @@ impl Host {
             if !crate::switch::on("VICTORY_COPIES_IN_VIDEO_MEMORY") {
                 return false;
             }
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
-            // SAFETY: the query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device.CheckFeatureSupport(
-                    D3D12_FEATURE_D3D12_OPTIONS16,
-                    (&raw mut options).cast(),
-                    size_of_val(&options) as u32,
-                )
-            }
-            .is_ok()
-                && options.GPUUploadHeapSupported.as_bool();
+            let ok = self.gpu_upload_heap();
             tracing::warn!(on = ok, "host copies of title memory in video memory (diagnostics)");
             ok
         })
@@ -3207,26 +3263,10 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
+        // In video memory only where system memory is full: the copies are
+        // read by the CPU too (refreshes compare, copy-backs read them).
+        match self.mapped_committed(&heap, &desc, D3D12_RESOURCE_STATE_COMMON, true) {
+            Ok(made) => Some(made),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
@@ -3482,6 +3522,47 @@ fn pump() {
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_fallback {
+    use super::*;
+
+    thread_local! {
+        /// System memory for the GPU reads as full on this thread.
+        pub(super) static FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Where system memory for the GPU is full, shared and upload buffers
+    /// are made in video memory the CPU maps (where the host has it), and
+    /// work as before; readback buffers are not.
+    #[test]
+    fn full_system_memory_moves_mapped_buffers_to_video_memory() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        FULL.set(true);
+        let shared = host.shared_buffer(1 << 16);
+        let upload = host.upload_buffer(1 << 16);
+        let readback = host.mapped_buffer(1 << 16, true);
+        FULL.set(false);
+        if !host.gpu_upload_heap() {
+            assert!(shared.is_none() && upload.is_none(), "nowhere else to go");
+            return;
+        }
+        assert!(readback.is_none(), "readback memory stays in system memory");
+        for (buffer, data) in [shared.expect("a shared buffer"), upload.expect("an upload buffer")] {
+            let mut props = D3D12_HEAP_PROPERTIES::default();
+            // SAFETY: plain query of a live resource.
+            unsafe { buffer.GetHeapProperties(Some(&mut props), None) }.expect("heap properties");
+            assert_eq!(props.Type, D3D12_HEAP_TYPE_GPU_UPLOAD);
+            // SAFETY: the mapped 64 KiB of the buffer.
+            unsafe {
+                data.add(100).write_volatile(0x5a);
+                assert_eq!(data.add(100).read_volatile(), 0x5a);
+            }
         }
     }
 }
