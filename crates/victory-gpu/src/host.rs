@@ -2732,7 +2732,9 @@ impl Host {
         state: D3D12_RESOURCE_STATES,
         or_video: bool,
     ) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
-        let make = |heap: &D3D12_HEAP_PROPERTIES| -> windows::core::Result<(ID3D12Resource, *mut u8)> {
+        let make = |heap: &D3D12_HEAP_PROPERTIES,
+                    state: D3D12_RESOURCE_STATES|
+         -> windows::core::Result<(ID3D12Resource, *mut u8)> {
             let mut buffer: Option<ID3D12Resource> = None;
             let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
             // SAFETY: plain creation and mapping of a CPU-visible buffer.
@@ -2754,10 +2756,10 @@ impl Host {
         let first = if memory_fallback::FULL.get() {
             Err(windows::core::HRESULT(crate::object::E_OUTOFMEMORY).into())
         } else {
-            make(heap)
+            make(heap, state)
         };
         #[cfg(not(test))]
-        let first = make(heap);
+        let first = make(heap, state);
         let full = match first {
             Err(e) if e.code().0 == crate::object::E_OUTOFMEMORY => e,
             made => return made,
@@ -2765,7 +2767,17 @@ impl Host {
         if !or_video || heap.Type == D3D12_HEAP_TYPE_GPU_UPLOAD || !self.gpu_upload_heap() {
             return Err(full);
         }
-        let made = make(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() })?;
+        // Not past most of the card's own budget: there, its textures would
+        // be evicted for these, or the buffers paged back to system memory.
+        if video_memory().is_some_and(|[(used, budget), _]| used > 0.85 * budget) {
+            return Err(full);
+        }
+        // A GPU upload heap's buffers start in the common state, as default
+        // memory's do (promoted on first use).
+        let made = make(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() },
+            D3D12_RESOURCE_STATE_COMMON,
+        )?;
         static PLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = PLACED.fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_power_of_two() {
@@ -3235,8 +3247,22 @@ impl Host {
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
-    /// the common state (buffers move out of it implicitly).
+    /// the common state (buffers move out of it implicitly). Where system
+    /// memory for the GPU is full, in video memory the CPU maps instead
+    /// (see [`Host::mapped_committed`]): host copies are read by the CPU
+    /// too (snapshots, copy-backs), slowly there, which beats failing.
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared(size, true)
+    }
+
+    /// A [`Host::shared_buffer`] the CPU scans every submission (written
+    /// pages' bitmaps): it stays in system memory, as reading video memory
+    /// at that rate cost most of a frame.
+    pub(crate) fn scanned_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared(size, false)
+    }
+
+    fn shared(&self, size: u64, or_video: bool) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
             CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
@@ -3244,7 +3270,7 @@ impl Host {
             ..Default::default()
         };
         #[cfg(feature = "diagnostics")]
-        let heap = if self.copies_in_video_memory() {
+        let heap = if or_video && self.copies_in_video_memory() {
             D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() }
         } else {
             heap
@@ -3263,9 +3289,7 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
-        // In video memory only where system memory is full: the copies are
-        // read by the CPU too (refreshes compare, copy-backs read them).
-        match self.mapped_committed(&heap, &desc, D3D12_RESOURCE_STATE_COMMON, true) {
+        match self.mapped_committed(&heap, &desc, D3D12_RESOURCE_STATE_COMMON, or_video) {
             Ok(made) => Some(made),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
@@ -3537,7 +3561,7 @@ mod memory_fallback {
 
     /// Where system memory for the GPU is full, shared and upload buffers
     /// are made in video memory the CPU maps (where the host has it), and
-    /// work as before; readback buffers are not.
+    /// work as before; readback buffers and bitmaps the CPU scans are not.
     #[test]
     fn full_system_memory_moves_mapped_buffers_to_video_memory() {
         let Some(host) = host() else {
@@ -3547,12 +3571,14 @@ mod memory_fallback {
         let shared = host.shared_buffer(1 << 16);
         let upload = host.upload_buffer(1 << 16);
         let readback = host.mapped_buffer(1 << 16, true);
+        let scanned = host.scanned_buffer(1 << 16);
         FULL.set(false);
         if !host.gpu_upload_heap() {
             assert!(shared.is_none() && upload.is_none(), "nowhere else to go");
             return;
         }
         assert!(readback.is_none(), "readback memory stays in system memory");
+        assert!(scanned.is_none(), "so do bitmaps the CPU scans");
         for (buffer, data) in [shared.expect("a shared buffer"), upload.expect("an upload buffer")] {
             let mut props = D3D12_HEAP_PROPERTIES::default();
             // SAFETY: plain query of a live resource.

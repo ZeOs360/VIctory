@@ -746,7 +746,7 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
             // Written pages, then one read mark per heap index.
             let bits = victory_shader::emit::VIEW_READS + victory_shader::emit::HEAP_VIEWS;
             let bytes = u64::from(bits / 8);
-            let (buffer, data) = host()?.shared_buffer(bytes)?;
+            let (buffer, data) = host()?.scanned_buffer(bytes)?;
             crate::host::name(&buffer, || "views' written pages and read slots".into());
             // SAFETY: our mapped buffer of `bytes` bytes.
             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };

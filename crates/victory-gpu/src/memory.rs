@@ -455,7 +455,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     })
     .flatten()?;
     let bits = (CAPACITY + 1) * BLOCK;
-    let (bitmap, data) = crate::host::host()?.shared_buffer((bits / 8).next_multiple_of(256) as u64)?;
+    let (bitmap, data) = crate::host::host()?.scanned_buffer((bits / 8).next_multiple_of(256) as u64)?;
     crate::host::name(&bitmap, || "title memory written pages".into());
     let words = bits / 32;
     // SAFETY: our mapped buffer of at least `words` dwords.
