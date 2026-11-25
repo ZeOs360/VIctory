@@ -461,7 +461,7 @@ impl Shadow {
         // page's bytes from before it (then they, not these, tell what the
         // shaders changed). Into this thread's buffer, kept between pages.
         let mut scratch = Scratch::take(n);
-        let title = &mut scratch.0;
+        let Scratch { title, runs } = &mut scratch;
         let read = crate::host::read_into(from as *const u8, title);
         #[cfg(test)]
         tests::marked_copy_back_at(tests::MarkedAt::Read);
@@ -487,7 +487,7 @@ impl Shadow {
             Some(bytes) => &bytes[from - page..to - page],
             None => title,
         };
-        let runs = changed_runs(host, before);
+        changed_runs(host, before, runs);
         if runs.is_empty() && saved.is_none() {
             // Untouched and unchanged: still guarded, and equal to the copy.
             return 0;
@@ -498,7 +498,7 @@ impl Shadow {
             let _writing = crate::watch::writing(from, n);
             // SAFETY: the runs lie in `host`, ours; the destination is the
             // title's page, which `store_runs` stops at if it went.
-            let at = unsafe { crate::watch::store_runs(from as *mut u8, host.as_ptr(), &runs) };
+            let at = unsafe { crate::watch::store_runs(from as *mut u8, host.as_ptr(), runs) };
             // Where a store failed (the page went, or is read-only not by
             // our guards), that run and the rest go through the kernel, as
             // far as mapped.
@@ -522,7 +522,7 @@ impl Shadow {
         // One holding it in part leaves it changed (the next update copies
         // it), and where the page cannot be read again: the bytes read, with
         // the shaders' merged.
-        for &[a, b] in &runs {
+        for &[a, b] in runs.iter() {
             title[a..b].copy_from_slice(&host[a..b]);
         }
         host.copy_from_slice(title);
@@ -881,64 +881,100 @@ pub(crate) fn forget_read(slot: u32) {
 }
 
 thread_local! {
-    /// [`Scratch`]'s buffer, kept between pages.
-    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// [`Scratch`]'s buffers, kept between pages.
+    static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<[usize; 2]>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
-/// A page's worth of bytes for a copy-back on this thread, given back when
-/// dropped: making and zeroing 64 KiB for each of ~1,500 marked pages a
-/// frame cost a few µs each.
-struct Scratch(Vec<u8>);
+/// A page's worth of bytes and a list of runs for a copy-back on this
+/// thread, given back when dropped: making and zeroing 64 KiB for each of
+/// ~1,500 marked pages a frame cost a few µs each, and the runs, ~1,900 a
+/// page, grew their list about ten times.
+struct Scratch {
+    title: Vec<u8>,
+    runs: Vec<[usize; 2]>,
+}
 
 impl Scratch {
-    /// `n` bytes (their values left over).
+    /// `n` bytes (their values left over), and no runs.
     fn take(n: usize) -> Scratch {
-        let mut bytes = SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
-        bytes.resize(n, 0);
-        Scratch(bytes)
+        let (mut title, mut runs) = SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        title.resize(n, 0);
+        runs.clear();
+        Scratch { title, runs }
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let bytes = std::mem::take(&mut self.0);
-        let _ = SCRATCH.try_with(|s| *s.borrow_mut() = bytes);
+        let kept = (std::mem::take(&mut self.title), std::mem::take(&mut self.runs));
+        let _ = SCRATCH.try_with(|s| *s.borrow_mut() = kept);
     }
 }
 
 /// The runs `[from, to]` (bytes `from..to`) where `now` differs from
-/// `before` (as long as each other), in order. Compared 8 bytes at a time,
-/// and only differing words byte by byte: in the world a marked page's
-/// changes are spread over most of it (a run every ~34 bytes), and a byte
-/// at a time cost about half of its copy-back.
-fn changed_runs(now: &[u8], before: &[u8]) -> Vec<[usize; 2]> {
-    fn mark(runs: &mut Vec<[usize; 2]>, i: usize) {
-        match runs.last_mut() {
-            Some([_, end]) if *end == i => *end = i + 1,
-            _ => runs.push([i, i + 1]),
+/// `before` (as long as each other), in order, into `runs`. Compared 64
+/// bytes at a time into a mask of the bytes that differ, whose runs of set
+/// bits are the runs: a few steps per run, none per byte (in the world a
+/// marked page has ~1,900 runs, spread over most of it).
+fn changed_runs(now: &[u8], before: &[u8], runs: &mut Vec<[usize; 2]>) {
+    /// Bit `i` set where byte `i` differs.
+    fn differing(now: &[u8; 64], before: &[u8; 64]) -> u64 {
+        use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+        let mut mask = 0;
+        for k in 0..4 {
+            // SAFETY: bytes 16k..16k + 16 of both arrays, loaded unaligned;
+            // SSE2 is part of x86-64.
+            let equal = unsafe {
+                let a = _mm_loadu_si128(now.as_ptr().add(16 * k).cast());
+                let b = _mm_loadu_si128(before.as_ptr().add(16 * k).cast());
+                _mm_movemask_epi8(_mm_cmpeq_epi8(a, b))
+            };
+            mask |= u64::from(!equal as u16) << (16 * k);
         }
+        mask
     }
-    let len = now.len().min(before.len());
-    let (now, before) = (&now[..len], &before[..len]);
-    let mut runs: Vec<[usize; 2]> = Vec::new();
-    let (words, _) = now.as_chunks::<8>();
-    let (old, _) = before.as_chunks::<8>();
-    for (w, (n, b)) in words.iter().zip(old).enumerate() {
-        let x = u64::from_ne_bytes(*n) ^ u64::from_ne_bytes(*b);
-        if x != 0 {
-            for (j, d) in x.to_ne_bytes().into_iter().enumerate() {
-                if d != 0 {
-                    mark(&mut runs, w * 8 + j);
+    /// The runs of `mask`'s low `width` bits, those of bytes from `base`
+    /// on; `open`, where a run still going at the last byte started.
+    fn add(runs: &mut Vec<[usize; 2]>, open: &mut Option<usize>, base: usize, mask: u64, width: u32) {
+        let mut i = 0;
+        while i < width {
+            let rest = mask >> i;
+            match *open {
+                Some(start) => {
+                    i += (!rest).trailing_zeros().min(width - i);
+                    if i < width {
+                        runs.push([start, base + i as usize]);
+                        *open = None;
+                    }
+                }
+                None => {
+                    i += rest.trailing_zeros().min(width - i);
+                    if i < width {
+                        *open = Some(base + i as usize);
+                    }
                 }
             }
         }
     }
-    for i in len / 8 * 8..len {
-        if now[i] != before[i] {
-            mark(&mut runs, i);
+    runs.clear();
+    let len = now.len().min(before.len());
+    let (now, before) = (&now[..len], &before[..len]);
+    let mut open = None;
+    let (blocks, _) = now.as_chunks::<64>();
+    let (old, _) = before.as_chunks::<64>();
+    for (k, (n, b)) in blocks.iter().zip(old).enumerate() {
+        let mask = differing(n, b);
+        if mask != 0 || open.is_some() {
+            add(runs, &mut open, k * 64, mask, 64);
         }
     }
-    runs
+    let tail = len / 64 * 64;
+    let mask = (tail..len).fold(0, |m, i| m | u64::from(now[i] != before[i]) << (i - tail));
+    add(runs, &mut open, tail, mask, (len - tail) as u32);
+    if let Some(start) = open {
+        runs.push([start, len]);
+    }
 }
 
 /// After a submission: every page its shaders marked as written through
@@ -1697,10 +1733,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// The runs found a word at a time are those a byte at a time finds:
-    /// across word edges, at the ends, in a length no multiple of a word.
+    /// The runs found 64 bytes at a time are those a byte at a time finds:
+    /// across block edges, at the ends, in a length no multiple of a block,
+    /// into a list holding runs from before.
     #[test]
     fn changed_runs_are_those_byte_by_byte() {
+        let mut kept = vec![[7, 9]; 3];
+        let mut changed_runs = |now: &[u8], before: &[u8]| {
+            super::changed_runs(now, before, &mut kept);
+            kept.clone()
+        };
         let byte_by_byte = |now: &[u8], before: &[u8]| {
             let mut runs: Vec<[usize; 2]> = Vec::new();
             for (i, (x, y)) in now.iter().zip(before).enumerate() {
@@ -1720,7 +1762,7 @@ pub(crate) mod tests {
             seed ^= seed << 17;
             seed
         };
-        for len in [0, 1, 63, 64, 65, 200, PAGE - 3, PAGE] {
+        for len in [0, 1, 63, 64, 65, 127, 128, 129, 200, PAGE - 3, PAGE] {
             let before: Vec<u8> = (0..len).map(|_| next() as u8).collect();
             for density in [0, 1, 8, 128, 256] {
                 let mut now = before.clone();
@@ -1732,12 +1774,23 @@ pub(crate) mod tests {
                 assert_eq!(changed_runs(&now, &before), byte_by_byte(&now, &before), "{len} bytes, {density}");
             }
         }
-        // A run across word edges, and one ending the slice.
-        let before = vec![0u8; 130];
+        // A run across a block edge, one ending at one (the next block
+        // unchanged), one starting at one, one going on into the tail, and
+        // one ending the slice.
+        let before = vec![0u8; 260];
         let mut now = before.clone();
         now[60..70].fill(1);
-        now[129] = 1;
-        assert_eq!(changed_runs(&now, &before), [[60, 70], [129, 130]]);
+        now[100..128].fill(1);
+        now[192..194].fill(1);
+        now[250..258].fill(1);
+        now[259] = 1;
+        let runs = [[60, 70], [100, 128], [192, 194], [250, 258], [259, 260]];
+        assert_eq!(changed_runs(&now, &before), runs);
+        // Slices that do not start on 16 bytes.
+        let shifted = runs.map(|[a, b]| [a - 1, b - 1]);
+        assert_eq!(changed_runs(&now[1..], &before[1..]), shifted);
+        now.fill(1);
+        assert_eq!(changed_runs(&now, &before), [[0, 260]]);
     }
 
     /// A title write to a marked page while its copy-back runs stays: only
