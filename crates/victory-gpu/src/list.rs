@@ -220,6 +220,25 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
     let _ = (this, wait);
 }
 
+/// A recycled host list from [`SPARE`], or a new one.
+#[cfg(windows)]
+fn take_list() -> Option<crate::host::HostList> {
+    #[cfg(test)]
+    if tests::NO_NEW_LIST.with(std::cell::Cell::get) {
+        return None;
+    }
+    if let Some(spare) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        return Some(spare);
+    }
+    match crate::host::host()?.new_list() {
+        Ok(made) => Some(made),
+        Err(e) => {
+            tracing::warn!(error = %e, "no host command list");
+            None
+        }
+    }
+}
+
 /// Moves a title list's recording on to its next host list (made, or one
 /// it held since an earlier recording, reset then): that host list.
 #[cfg(windows)]
@@ -229,8 +248,7 @@ fn next_segment<'a>(this: This) -> Option<&'a crate::host::HostList> {
     let k = list.segment.load(std::sync::atomic::Ordering::Relaxed) + 1;
     let mut hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
     if hosts.len() <= k {
-        let made = crate::host::host()?.new_list().ok()?;
-        hosts.push(std::sync::Arc::new(made));
+        hosts.push(std::sync::Arc::new(take_list()?));
     }
     list.segment.store(k, std::sync::atomic::Ordering::Relaxed);
     let next: *const crate::host::HostList = std::sync::Arc::as_ptr(&hosts[k]);
@@ -249,20 +267,33 @@ fn restart(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
     let list = unsafe { &*this.cast::<List>() };
     let used = list.segment.swap(0, std::sync::atomic::Ordering::Relaxed);
     let mut hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
+    if hosts.is_empty() {
+        if let Some(fresh) = take_list() {
+            hosts.push(std::sync::Arc::new(fresh));
+        }
+        return None;
+    }
     let mut left = None;
+    let mut keep = hosts.len();
     for (k, h) in hosts.iter_mut().enumerate() {
         if std::sync::Arc::strong_count(h) > 1 {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(segment = k, "a list reset while a queue still holds part of it: that part keeps its own host list");
-            let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
-            match spare.map(Ok).or_else(|| crate::host::host().map(|host| host.new_list())) {
-                Some(Ok(fresh)) => left = Some(std::mem::replace(h, std::sync::Arc::new(fresh))),
-                _ => continue,
+            if k < keep {
+                if let Some(fresh) = take_list() {
+                    left = Some(std::mem::replace(h, std::sync::Arc::new(fresh)));
+                    continue;
+                }
+                // Never leave a closed, queue-held host list in place: recording
+                // into it or closing it again fails `ID3D12GraphicsCommandList::Close`.
+                keep = k;
             }
-        } else if k <= used {
+            left = Some(h.clone());
+        } else if k < keep && k <= used {
             h.reset();
         }
     }
+    hosts.truncate(keep);
     left
 }
 
@@ -2003,6 +2034,46 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    thread_local! {
+        pub(super) static NO_NEW_LIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// An early reset when no replacement host list can be allocated (under
+    /// memory pressure) must detach the closed, queue-held host list instead of
+    /// leaving it in place to be closed again, and recover on the next reset.
+    #[cfg(windows)]
+    #[test]
+    fn early_reset_without_a_new_host_list_does_not_keep_the_closed_one() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        assert!(host_list(list).is_some());
+        assert_eq!(close(list), S_OK);
+        // Simulate a queue holding the closed segment while the title resets it.
+        let held = segments(list);
+        assert_eq!(held.len(), 1);
+        NO_NEW_LIST.with(|f| f.set(true));
+        let hr = reset(list, allocator, null);
+        NO_NEW_LIST.with(|f| f.set(false));
+        assert_eq!(hr, S_OK);
+        assert!(host_list(list).is_none(), "closed queue-held list must not stay attached");
+        assert_eq!(close(list), S_OK, "closing without a host list must not fail");
+        // Once the queue finishes and recycles it, the next reset recovers.
+        held.into_iter().for_each(recycle);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(host_list(list).is_some(), "recovered a fresh host list on the next reset");
+        assert_eq!(close(list), S_OK);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
