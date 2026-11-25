@@ -104,7 +104,8 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
-    /// Runs of bytes the shaders changed in marked pages, each its own write.
+    /// Runs of bytes the shaders changed in marked pages, written back as
+    /// they are (not joined across the bytes between them).
     MarkedRuns,
 }
 const COUNTERS: usize = 62;

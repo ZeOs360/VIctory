@@ -488,7 +488,7 @@ impl Shadow {
     /// threads write the same pages meanwhile (its records share the GPU
     /// heap), and putting the copy's older bytes back over theirs broke them
     /// (a fence list read as -1, as in [`Shadow::copy_back`]). The runs are
-    /// written with plain stores ([`crate::watch::store`]): in the world
+    /// written with plain stores ([`crate::watch::store_runs`]): in the world
     /// they are millions a frame, a few bytes each, and a system call apiece
     /// cost seconds.
     /// Returns the bytes written.
@@ -507,9 +507,10 @@ impl Shadow {
         let n = to - from;
         // Read while still armed: a title write landing meanwhile keeps the
         // page's bytes from before it (then they, not these, tell what the
-        // shaders changed).
-        let mut title = vec![0u8; n];
-        let read = crate::host::read_into(from as *const u8, &mut title);
+        // shaders changed). Into this thread's buffer, kept between pages.
+        let mut scratch = Scratch::take(n);
+        let Scratch { title, runs } = &mut scratch;
+        let read = crate::host::read_into(from as *const u8, title);
         #[cfg(test)]
         tests::marked_copy_back_at(tests::MarkedAt::Read);
         // Our own write below must not save the page for this copy again.
@@ -528,22 +529,15 @@ impl Shadow {
                 return 0;
             }
         };
-        // SAFETY: inside the mapping; only the submitting thread writes it.
+        // SAFETY: inside the mapping; only the thread putting this page
+        // back writes this part of it (`for_each_by_page` gives each page
+        // to one thread).
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
         let before: &[u8] = match &saved {
             Some(bytes) => &bytes[from - page..to - page],
-            None => &title,
+            None => title,
         };
-        // The runs of bytes the shaders changed.
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for (i, (h, b)) in host.iter().zip(before).enumerate() {
-            if h != b {
-                match runs.last_mut() {
-                    Some((_, end)) if *end == i => *end = i + 1,
-                    _ => runs.push((i, i + 1)),
-                }
-            }
-        }
+        changed_runs(host, before, runs);
         if runs.is_empty() && saved.is_none() {
             // Untouched and unchanged: still guarded, and equal to the copy.
             return 0;
@@ -552,45 +546,37 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MarkedRuns, runs.len() as u64);
             let _writing = crate::watch::writing(from, n);
-            // Once a store fails (the page went, or is read-only not by our
-            // guards), the rest go through the kernel, as far as mapped:
-            // faulting again for each run would cost more.
-            let mut stores = true;
-            for &(a, b) in &runs {
-                let mut done = 0;
-                if stores {
-                    // SAFETY: `host[a..b]` is ours; the destination is the
-                    // title's page, which `store` stops at if it went.
-                    let left = unsafe {
-                        crate::watch::store((from + a) as *mut u8, host[a..].as_ptr(), b - a)
-                    };
-                    done = b - a - left;
-                    stores = left == 0;
-                }
-                if done < b - a {
-                    crate::host::write_mapped(
-                        (from + a + done) as *mut u8,
-                        host[a + done..].as_ptr(),
-                        b - a - done,
-                    );
-                }
+            // SAFETY: the runs lie in `host`, ours; the destination is the
+            // title's page, which `store_runs` stops at if it went.
+            let at = unsafe { crate::watch::store_runs(from as *mut u8, host.as_ptr(), runs) };
+            // Where a store failed (the page went, or is read-only not by
+            // our guards), that run and the rest go through the kernel, as
+            // far as mapped.
+            for &[a, b] in &runs[at..] {
+                crate::host::write_mapped((from + a) as *mut u8, host[a..].as_ptr(), b - a);
             }
         }
-        // The copy takes the title's bytes, the shaders' among them.
-        for &(a, b) in &runs {
-            title[a..b].copy_from_slice(&host[a..b]);
-        }
-        // A copy holding the whole page takes it: guarded first and read
-        // again after, so a title write before the guard is in what is read,
-        // and one after it marks the page changed again. One holding it in
-        // part leaves it changed (the next update copies it).
+        let written = runs.iter().map(|[a, b]| b - a).sum();
+        // The copy takes the title's bytes, the shaders' among them. A copy
+        // holding the whole page takes it: guarded first and read again
+        // after, so a title write before the guard is in what is read, and
+        // one after it marks the page changed again (the shaders' bytes are
+        // in the title's then, and need no merging).
         if from == page && to == page + PAGE {
             t.taken(&[page / PAGE]);
-            // Where the page cannot be read, the bytes merged above stay.
-            crate::host::read_into(from as *const u8, &mut title);
+            if crate::host::read_into(from as *const u8, title) {
+                host.copy_from_slice(title);
+                return written;
+            }
         }
-        host.copy_from_slice(&title);
-        runs.iter().map(|(a, b)| b - a).sum()
+        // One holding it in part leaves it changed (the next update copies
+        // it), and where the page cannot be read again: the bytes read, with
+        // the shaders' merged.
+        for &[a, b] in runs.iter() {
+            title[a..b].copy_from_slice(&host[a..b]);
+        }
+        host.copy_from_slice(title);
+        written
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -983,6 +969,103 @@ fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow
         }
         work();
     });
+}
+
+thread_local! {
+    /// [`Scratch`]'s buffers, kept between pages.
+    static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<[usize; 2]>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// A page's worth of bytes and a list of runs for a copy-back on this
+/// thread, given back when dropped: making and zeroing 64 KiB for each of
+/// ~1,500 marked pages a frame cost a few µs each, and the runs, ~1,900 a
+/// page, grew their list about ten times.
+struct Scratch {
+    title: Vec<u8>,
+    runs: Vec<[usize; 2]>,
+}
+
+impl Scratch {
+    /// `n` bytes (their values left over), and no runs.
+    fn take(n: usize) -> Scratch {
+        let (mut title, mut runs) = SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        title.resize(n, 0);
+        runs.clear();
+        Scratch { title, runs }
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let kept = (std::mem::take(&mut self.title), std::mem::take(&mut self.runs));
+        let _ = SCRATCH.try_with(|s| *s.borrow_mut() = kept);
+    }
+}
+
+/// The runs `[from, to]` (bytes `from..to`) where `now` differs from
+/// `before` (as long as each other), in order, into `runs`. Compared 64
+/// bytes at a time into a mask of the bytes that differ, whose runs of set
+/// bits are the runs: a few steps per run, none per byte (in the world a
+/// marked page has ~1,900 runs, spread over most of it).
+fn changed_runs(now: &[u8], before: &[u8], runs: &mut Vec<[usize; 2]>) {
+    /// Bit `i` set where byte `i` differs.
+    fn differing(now: &[u8; 64], before: &[u8; 64]) -> u64 {
+        use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+        let mut mask = 0;
+        for k in 0..4 {
+            // SAFETY: bytes 16k..16k + 16 of both arrays, loaded unaligned;
+            // SSE2 is part of x86-64.
+            let equal = unsafe {
+                let a = _mm_loadu_si128(now.as_ptr().add(16 * k).cast());
+                let b = _mm_loadu_si128(before.as_ptr().add(16 * k).cast());
+                _mm_movemask_epi8(_mm_cmpeq_epi8(a, b))
+            };
+            mask |= u64::from(!equal as u16) << (16 * k);
+        }
+        mask
+    }
+    /// The runs of `mask`'s low `width` bits, those of bytes from `base`
+    /// on; `open`, where a run still going at the last byte started.
+    fn add(runs: &mut Vec<[usize; 2]>, open: &mut Option<usize>, base: usize, mask: u64, width: u32) {
+        let mut i = 0;
+        while i < width {
+            let rest = mask >> i;
+            match *open {
+                Some(start) => {
+                    i += (!rest).trailing_zeros().min(width - i);
+                    if i < width {
+                        runs.push([start, base + i as usize]);
+                        *open = None;
+                    }
+                }
+                None => {
+                    i += rest.trailing_zeros().min(width - i);
+                    if i < width {
+                        *open = Some(base + i as usize);
+                    }
+                }
+            }
+        }
+    }
+    runs.clear();
+    let len = now.len().min(before.len());
+    let (now, before) = (&now[..len], &before[..len]);
+    let mut open = None;
+    let (blocks, _) = now.as_chunks::<64>();
+    let (old, _) = before.as_chunks::<64>();
+    for (k, (n, b)) in blocks.iter().zip(old).enumerate() {
+        let mask = differing(n, b);
+        if mask != 0 || open.is_some() {
+            add(runs, &mut open, k * 64, mask, 64);
+        }
+    }
+    let tail = len / 64 * 64;
+    let mask = (tail..len).fold(0, |m, i| m | u64::from(now[i] != before[i]) << (i - tail));
+    add(runs, &mut open, tail, mask, (len - tail) as u32);
+    if let Some(start) = open {
+        runs.push([start, len]);
+    }
 }
 
 /// After a submission: every page its shaders marked as written through
@@ -1832,6 +1915,66 @@ pub(crate) mod tests {
         if let Some((_, f)) = hook {
             f();
         }
+    }
+
+    /// The runs found 64 bytes at a time are those a byte at a time finds:
+    /// across block edges, at the ends, in a length no multiple of a block,
+    /// into a list holding runs from before.
+    #[test]
+    fn changed_runs_are_those_byte_by_byte() {
+        let mut kept = vec![[7, 9]; 3];
+        let mut changed_runs = |now: &[u8], before: &[u8]| {
+            super::changed_runs(now, before, &mut kept);
+            kept.clone()
+        };
+        let byte_by_byte = |now: &[u8], before: &[u8]| {
+            let mut runs: Vec<[usize; 2]> = Vec::new();
+            for (i, (x, y)) in now.iter().zip(before).enumerate() {
+                if x != y {
+                    match runs.last_mut() {
+                        Some([_, end]) if *end == i => *end = i + 1,
+                        _ => runs.push([i, i + 1]),
+                    }
+                }
+            }
+            runs
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for len in [0, 1, 63, 64, 65, 127, 128, 129, 200, PAGE - 3, PAGE] {
+            let before: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            for density in [0, 1, 8, 128, 256] {
+                let mut now = before.clone();
+                for b in &mut now {
+                    if (next() % 256) < density {
+                        *b = b.wrapping_add(1);
+                    }
+                }
+                assert_eq!(changed_runs(&now, &before), byte_by_byte(&now, &before), "{len} bytes, {density}");
+            }
+        }
+        // A run across a block edge, one ending at one (the next block
+        // unchanged), one starting at one, one going on into the tail, and
+        // one ending the slice.
+        let before = vec![0u8; 260];
+        let mut now = before.clone();
+        now[60..70].fill(1);
+        now[100..128].fill(1);
+        now[192..194].fill(1);
+        now[250..258].fill(1);
+        now[259] = 1;
+        let runs = [[60, 70], [100, 128], [192, 194], [250, 258], [259, 260]];
+        assert_eq!(changed_runs(&now, &before), runs);
+        // Slices that do not start on 16 bytes.
+        let shifted = runs.map(|[a, b]| [a - 1, b - 1]);
+        assert_eq!(changed_runs(&now[1..], &before[1..]), shifted);
+        now.fill(1);
+        assert_eq!(changed_runs(&now, &before), [[0, 260]]);
     }
 
     /// A title write to a marked page while its copy-back runs stays: only
