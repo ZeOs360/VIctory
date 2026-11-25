@@ -477,24 +477,27 @@ impl Shadow {
                 }
             }
         }
+        if runs.is_empty() && saved.is_none() {
+            // Untouched and unchanged: still guarded, and equal to the copy.
+            return 0;
+        }
         if !runs.is_empty() {
             let _writing = crate::watch::writing(from, n);
             for &(a, b) in &runs {
                 crate::host::write_mapped((from + a) as *mut u8, host[a..].as_ptr(), b - a);
             }
         }
-        // The copy takes the title's bytes, the shaders' among them. A whole
-        // page is guarded first and read again after: a title write before
+        // The copy takes the title's bytes, the shaders' among them. The
+        // page (the copy's part of it, which `Tracked::take` takes as whole
+        // too) is guarded first and read again after: a title write before
         // the guard is in what is read, one after it marks the page changed
         // again.
         for &(a, b) in &runs {
             title[a..b].copy_from_slice(&host[a..b]);
         }
-        if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
-            // Where the page cannot be read, the bytes merged above stay.
-            crate::host::read_into(from as *const u8, &mut title);
-        }
+        t.taken(&[page / PAGE]);
+        // Where the page cannot be read, the bytes merged above stay.
+        crate::host::read_into(from as *const u8, &mut title);
         host.copy_from_slice(&title);
         runs.iter().map(|(a, b)| b - a).sum()
     }
@@ -563,6 +566,8 @@ impl Shadow {
         let mut copied = 0;
         for (a, b) in runs {
             copied += self.copy(a, b);
+            // SAFETY: inside the mapping.
+            t.refreshed(a, unsafe { std::slice::from_raw_parts(self.data.add(a - start), b - a) });
             let (a, b) = (a - start, b - start);
             for (at, bytes) in before.0.iter_mut() {
                 let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
@@ -586,8 +591,18 @@ impl Shadow {
             let runs = t.take(from, to);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
-            // Cut to the range: next to it shaders may be writing the copy.
-            let copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
+            // Cut to the range: next to it shaders may be writing the copy
+            // (and its pages may be armed for them).
+            let start = self.start as usize;
+            let copied: usize = runs
+                .into_iter()
+                .map(|(a, b)| {
+                    let n = self.copy(a, b);
+                    // SAFETY: inside the mapping.
+                    t.refreshed(a, unsafe { std::slice::from_raw_parts(self.data.add(a - start), b - a) });
+                    n
+                })
+                .sum();
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1301,8 +1316,8 @@ mod tests {
         assert!(copy.before.lock().unwrap().0.is_empty(), "no snapshot");
         // Shader writes only at offset 16 (leaving offset 200 stale at 0xff).
         copy.write_host((p + 16) as u64, &[0xaa, 0xbb, 0xcc, 0xdd]);
-        // Inject a title write at offset 200 right after `t.changed` returns
-        // false inside `copy_back_marked` and before `read_into` / `write_mapped`.
+        // Inject a title write at offset 200 inside `copy_back_marked`, after
+        // it read the page and found it untouched, before it writes.
         let injected = Arc::new(AtomicBool::new(false));
         let injected_flag = injected.clone();
         let _hook = AfterChangedHook::install(move || {

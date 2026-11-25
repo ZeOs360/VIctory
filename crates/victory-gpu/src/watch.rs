@@ -373,6 +373,23 @@ impl Tracked {
         }
     }
 
+    /// The copy took `bytes` of title memory at `at` again: what pages there
+    /// kept from before is those bytes now (a title write between the guard
+    /// and the copy kept the older ones, and the copy holds the newer).
+    pub(crate) fn refreshed(&self, at: usize, bytes: &[u8]) {
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        if saved.bytes.is_empty() {
+            return;
+        }
+        let end = at + bytes.len();
+        for page in at / PAGE..end.div_ceil(PAGE) {
+            if let Some(kept) = saved.bytes.get_mut(&page) {
+                let (s, e) = (at.max(page * PAGE), end.min((page + 1) * PAGE));
+                kept[s - page * PAGE..e - page * PAGE].copy_from_slice(&bytes[s - at..e - at]);
+            }
+        }
+    }
+
     /// No shader writes the copy any more: nothing is armed or kept.
     pub(crate) fn disarm(&self) {
         let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
@@ -476,26 +493,40 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = changed_here(g, first, last, save);
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
+    // Every holder keeps its bytes while the pages are still guarded, then
+    // they are opened: a write by another thread, or through another
+    // mapping, lands after what was kept, not in it.
+    marked_here(g, first, last, save);
+    for &page in &others {
+        marked_here(g, page, page + 1, save);
+    }
+    let guarded = opened_here(g, first, last);
     for page in others {
-        changed_here(g, page, page + 1, save);
+        opened_here(g, page, page + 1);
     }
     guarded
 }
 
-/// [`changed`] of `[first, last)` alone. With `save`, before the write
-/// lands: trackers armed for a page they had taken keep its bytes.
-fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+/// Gives write access back to pages of `[first, last)` we guarded. True if
+/// one was guarded.
+fn opened_here(g: &mut Guards, first: usize, last: usize) -> bool {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
     for &page in &guarded {
         open(g, page);
     }
+    !guarded.is_empty()
+}
+
+/// [`changed`] of `[first, last)` alone, in its trackers. With `save`,
+/// before the write lands: trackers armed for a page they had taken keep
+/// its bytes.
+fn marked_here(g: &mut Guards, first: usize, last: usize, save: bool) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
@@ -506,7 +537,6 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
     }
-    !guarded.is_empty()
 }
 
 /// At each presented frame (diagnostics): counts the tracked pages written
