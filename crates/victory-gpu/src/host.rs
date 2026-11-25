@@ -1152,6 +1152,14 @@ impl Host {
         }
     }
 
+    /// Tests: no submission runs while this is held, so none refreshes a
+    /// host copy or copies marked pages back meanwhile (as during
+    /// [`Host::execute`]'s own copy-back).
+    #[cfg(test)]
+    pub(crate) fn no_submissions(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -3933,6 +3941,9 @@ mod batch {   // `mod tests` is already taken at the top of this file
     #[test]
     fn a_copy_is_refreshed_once_per_submission_by_the_pages_written() {
         use crate::watch::PAGE;
+        // A submission meanwhile (another test's) would refresh this copy
+        // or take its marks: none runs while this is held.
+        let _one = super::host().map(|h| h.no_submissions());
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
         crate::shadow::register(p, p as u64, len as u64);

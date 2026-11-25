@@ -1502,6 +1502,9 @@ pub(crate) mod tests {
     /// goes back, and a title write made after the refresh is not undone.
     #[test]
     fn title_writes_under_a_busy_range_are_copied() {
+        // A submission meanwhile (another test's) would refresh this copy
+        // or take its marks: none runs while this is held.
+        let _one = host().map(|h| h.no_submissions());
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -1543,6 +1546,9 @@ pub(crate) mod tests {
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
             VirtualAlloc, VirtualFree, VirtualQuery,
         };
+        // A submission meanwhile (another test's) would refresh this copy
+        // or take its marks: none runs while this is held.
+        let _one = host().map(|h| h.no_submissions());
         // A pool page and a plain one right after it, in two pages found free
         // (other tests allocate meanwhile: tried again if taken).
         let (pool, plain) = (0..8)
@@ -1625,6 +1631,9 @@ pub(crate) mod tests {
     /// ranges declared it, and nothing else does.
     #[test]
     fn snapshots_cover_the_declared_ranges_and_writes_go_back_once() {
+        // A submission meanwhile (another test's) would refresh this copy
+        // or take its marks: none runs while this is held.
+        let _one = host().map(|h| h.no_submissions());
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
         register(p, p as u64, len as u64);
@@ -1664,6 +1673,9 @@ pub(crate) mod tests {
     /// byte there (no mark) is not put back. The bits are cleared.
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
+        // A submission meanwhile (another test's) would refresh this copy
+        // or take its marks: none runs while this is held.
+        let _one = host().map(|h| h.no_submissions());
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
@@ -1711,6 +1723,9 @@ pub(crate) mod tests {
     /// marks of the same submission go back.
     #[test]
     fn marks_of_shaders_using_title_memory_are_held_back() {
+        // A submission meanwhile (another test's) would refresh this copy
+        // or take its marks: none runs while this is held.
+        let _one = host().map(|h| h.no_submissions());
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -1746,6 +1761,9 @@ pub(crate) mod tests {
     /// an inner buffer's copy of the same pages alike.
     #[test]
     fn what_a_frame_withholds_leaves_the_copies_at_its_end() {
+        // A submission meanwhile (another test's) would refresh this copy
+        // or take its marks: none runs while this is held.
+        let _one = host().map(|h| h.no_submissions());
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         // SAFETY: a byte of our pool.
@@ -1786,6 +1804,9 @@ pub(crate) mod tests {
     /// back to the pre-fault value.
     #[test]
     fn partial_refresh_under_marked_range_updates_saved_bytes() {
+        // A submission meanwhile (another test's) would refresh this copy
+        // or take its marks: none runs while this is held.
+        let _one = host().map(|h| h.no_submissions());
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -1826,6 +1847,9 @@ pub(crate) mod tests {
     /// one placed inside it): every shader write reaches title memory.
     #[test]
     fn many_marked_pages_all_go_back() {
+        // A submission meanwhile (another test's) would refresh these copies
+        // or take their marks: none runs while this is held.
+        let _one = host().map(|h| h.no_submissions());
         const PAGES: usize = 96;
         let p = crate::watch::tests::pool(PAGES);
         let len = PAGES * PAGE;
@@ -1985,6 +2009,9 @@ pub(crate) mod tests {
     /// fence list read as -1).
     #[test]
     fn marked_copy_back_keeps_a_title_write_made_meanwhile() {
+        // A submission meanwhile (another test's) would refresh this copy
+        // or take its marks: none runs while this is held.
+        let _one = host().map(|h| h.no_submissions());
         for at in [MarkedAt::Read, MarkedAt::Finished] {
             let p = crate::watch::tests::pool(1);
             let len = PAGE;
