@@ -365,18 +365,12 @@ impl Tracked {
 
     /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
     /// pages there written next after they were taken have their bytes kept
-    /// first ([`Tracked::saved`]).
+    /// first ([`Tracked::finish`]).
     pub(crate) fn arm(&self, from: usize, to: usize) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from < to {
             self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.extend(from / PAGE..to.div_ceil(PAGE));
         }
-    }
-
-    /// Page `page` (a page number) needs no saving any more: its copy-back
-    /// is under way.
-    pub(crate) fn unarm(&self, page: usize) {
-        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.remove(&page);
     }
 
     /// No shader writes the copy any more: nothing is armed or kept.
@@ -386,11 +380,33 @@ impl Tracked {
         saved.bytes.clear();
     }
 
-    /// The bytes page `page` (a page number) held when it was first written
-    /// since it was taken, if it was armed then (and so changed).
-    pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
-        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
+    /// The copy-back of page `page` (a page number) has read it: it needs
+    /// no saving any more, and what the title did to it until now. Under the
+    /// guard lock, which the write handler takes before it marks or saves a
+    /// page: a title write lands wholly before this (changed, saved if
+    /// armed) or after it.
+    pub(crate) fn finish(&self, page: usize) -> Finished {
+        let _g = guards();
+        let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner()).contains(&page);
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        saved.armed.remove(&page);
+        match saved.bytes.remove(&page) {
+            Some(bytes) => Finished::Saved(bytes),
+            None if changed => Finished::Unsaved,
+            None => Finished::Untouched,
+        }
     }
+}
+
+/// What the title did to a page a copy-back read ([`Tracked::finish`]).
+pub(crate) enum Finished {
+    /// Not written since the copy took it: the bytes read are the copy's
+    /// from before.
+    Untouched,
+    /// Written while armed: the bytes it held before the first write.
+    Saved(Box<[u8]>),
+    /// Written while not armed: what it held before is not known.
+    Unsaved,
 }
 
 /// Makes `pages` read-only where not already (in runs), and returns those
