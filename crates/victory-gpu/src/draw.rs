@@ -547,31 +547,28 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(&p.name);
         // The bound view heap's mark table and the bitmap shaders mark
-        // their writes through views in (`crate::shadow::copy_back_marks`).
-        if let Some((table_param, bitmap_param)) = p.marks {
-            let heap = match self.heaps[0] {
-                0 => crate::memory::heap(),
-                h => crate::descriptor::heap(h as This).host(),
-            };
-            let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes()) else {
-                once!("a shader marking its writes without a view heap: dropped");
-                not_run("write marks without a view heap");
-                return false;
-            };
-            list.keep(table);
-            // SAFETY: an open list; the table lives while the list holds it,
-            // the bitmap for good.
-            unsafe {
-                let table = table.GetGPUVirtualAddress();
-                if compute {
-                    l.SetComputeRootShaderResourceView(table_param, table);
-                    l.SetComputeRootUnorderedAccessView(bitmap_param, bitmap);
-                } else {
-                    l.SetGraphicsRootShaderResourceView(table_param, table);
-                    l.SetGraphicsRootUnorderedAccessView(bitmap_param, bitmap);
-                }
+        // their writes through views in (`crate::shadow::copy_back_marks`):
+        // found now (without them the draw does not run), set with the
+        // other root arguments below, after any depth copy of ours has
+        // replaced the compute root signature (that leaves arguments set
+        // before it undefined).
+        let marks = match p.marks {
+            None => None,
+            Some((table_param, bitmap_param)) => {
+                let heap = match self.heaps[0] {
+                    0 => crate::memory::heap(),
+                    h => crate::descriptor::heap(h as This).host(),
+                };
+                let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes()) else {
+                    once!("a shader marking its writes without a view heap: dropped");
+                    not_run("write marks without a view heap");
+                    return false;
+                };
+                list.keep(table);
+                // SAFETY: a live buffer.
+                Some((table_param, unsafe { table.GetGPUVirtualAddress() }, bitmap_param, bitmap))
             }
-        }
+        };
         // Shaders taking views from the heap itself read (or write) views no
         // table names: everything the bound heap's views reach is brought up
         // to date at submission (`crate::bindless`).
@@ -767,6 +764,19 @@ impl State {
                             l.SetGraphicsRootUnorderedAccessView(param, dirty);
                         }
                     }
+                }
+            }
+        }
+        if let Some((table_param, table, bitmap_param, bitmap)) = marks {
+            // SAFETY: an open list; the table lives while the list holds it,
+            // the bitmap for good.
+            unsafe {
+                if compute {
+                    l.SetComputeRootShaderResourceView(table_param, table);
+                    l.SetComputeRootUnorderedAccessView(bitmap_param, bitmap);
+                } else {
+                    l.SetGraphicsRootShaderResourceView(table_param, table);
+                    l.SetGraphicsRootUnorderedAccessView(bitmap_param, bitmap);
                 }
             }
         }
