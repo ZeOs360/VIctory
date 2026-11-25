@@ -638,6 +638,16 @@ fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        // A page that cannot be read in, or a title's own guard page, ends
+        // `store`'s copy as the kernel's copy ends (it fails).
+        const IN_PAGE_ERROR: NTSTATUS = 0xC000_0006_u32 as NTSTATUS;
+        const GUARD_PAGE_VIOLATION: NTSTATUS = 0x8000_0001_u32 as NTSTATUS;
+        if (r.ExceptionCode == IN_PAGE_ERROR || r.ExceptionCode == GUARD_PAGE_VIOLATION)
+            // SAFETY: the system passes the faulting thread's context.
+            && unsafe { store_failed(&mut *(*info).ContextRecord) }
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         const WRITE: usize = 1;
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
@@ -658,16 +668,99 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
+        drop(g);
+        // SAFETY: the system passes the faulting thread's context.
+        if unsafe { store_failed(&mut *(*info).ContextRecord) } {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        EXCEPTION_CONTINUE_SEARCH
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+// `victory_gpu_store(dst, src, len)`: copies with `rep movsb` and returns
+// the bytes not copied, which is 0 unless a destination page faulted (then
+// [`store_failed`] resumes at `_end` with `rcx` the bytes left: a fault in
+// `rep movsb` leaves the counts of the bytes done, or of fewer). It keeps
+// `rdi`/`rsi` (the callee's) on the stack, with unwind data saying so.
+// Its labels are data symbols, compared with the faulting `rip` as they are
+// (no import or incremental-link thunk).
+std::arch::global_asm!(
+    ".globl victory_gpu_store",
+    ".globl victory_gpu_store_copy",
+    ".globl victory_gpu_store_end",
+    ".def victory_gpu_store",
+    ".scl 2",
+    ".type 32",
+    ".endef",
+    "victory_gpu_store:",
+    ".seh_proc victory_gpu_store",
+    "push rdi",
+    ".seh_pushreg rdi",
+    "push rsi",
+    ".seh_pushreg rsi",
+    ".seh_endprologue",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, r8",
+    "cld",
+    "victory_gpu_store_copy:",
+    "rep movsb",
+    "victory_gpu_store_end:",
+    "mov rax, rcx",
+    "pop rsi",
+    "pop rdi",
+    "ret",
+    ".seh_endproc",
+);
+
+unsafe extern "C" {
+    fn victory_gpu_store(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    static victory_gpu_store_copy: u8;
+    static victory_gpu_store_end: u8;
+}
+
+/// Copies `len` bytes from host memory at `src` into title memory at `dst`
+/// with plain stores: a system call per piece (as [`crate::host::write_mapped`])
+/// cost ~1 µs, and the copy-back of marked pages writes them in thousands of
+/// runs of a few bytes. Stops at a destination page that is not writable
+/// (nothing mapped, or read-only, not by our guards), as the kernel's copy
+/// does instead of faulting, and returns the bytes not copied. Guarded
+/// pages fault into the write handler as the title's writes do. A title's
+/// own guard page stops it as well (spent, as a kernel copy's probe spends
+/// it). The count left may be more than the bytes really left (a fast
+/// string copy reports a fault where it last took stock): what is past it
+/// is written again, with the same bytes.
+///
+/// # Safety
+/// `src` is `len` readable bytes of host memory; `dst` is title memory,
+/// which may be unmapped meanwhile. The caller holds none of this module's
+/// locks: a fault in the copy takes them.
+pub(crate) unsafe fn store(dst: *mut u8, src: *const u8, len: usize) -> usize {
+    install();
+    // SAFETY: the routine copies `len` bytes; a fault at the destination
+    // ends it (see `store_failed`), the source is the caller's.
+    unsafe { victory_gpu_store(dst, src, len) }
+}
+
+/// For the write handler: a write fault in [`store`]'s copy, which does
+/// not retry it but returns (with `rcx` the bytes left).
+///
+/// # Safety
+/// `context` is a faulting thread's.
+unsafe fn store_failed(context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> bool {
+    let copy = &raw const victory_gpu_store_copy as u64;
+    if context.Rip != copy {
+        return false;
+    }
+    context.Rip = &raw const victory_gpu_store_end as u64;
+    true
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -752,6 +845,65 @@ pub(crate) mod tests {
         title_memory_remapped(p, PAGE);
         assert!(a.changed(p / PAGE) && !a.changed(p / PAGE + 1));
         drop((a, b));
+        free(p);
+    }
+
+    /// `store` writes guarded pages as a title write does (they change),
+    /// and stops instead of faulting at a page with nothing mapped or one
+    /// read-only not by our guards, returning the bytes left.
+    #[test]
+    fn stores_mark_guarded_pages_and_stop_at_unwritable_ones() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_DECOMMIT, PAGE_GUARD, PAGE_READONLY, VirtualProtect,
+        };
+        let from: Vec<u8> = (0..3 * PAGE).map(|i| (i % 251) as u8 + 1).collect();
+        let p = pool(3);
+        let t = track(p, 3 * PAGE, true).expect("tracked");
+        assert_eq!(t.take(p, p + 3 * PAGE), [(p, p + 3 * PAGE)]);
+        // SAFETY: our pool; the source is `from`.
+        let left = unsafe { store((p + 10) as *mut u8, from.as_ptr(), 100) };
+        assert_eq!(left, 0);
+        // SAFETY: committed and readable.
+        let got = unsafe { std::slice::from_raw_parts((p + 10) as *const u8, 100) };
+        assert_eq!(got, &from[..100]);
+        assert!(t.changed(p / PAGE) && !t.changed(p / PAGE + 1));
+        drop(t);
+        // The middle page read-only (not ours), the last decommitted: the
+        // copy stops at the first of them.
+        let mut old = 0;
+        // SAFETY: pages of our pool.
+        unsafe {
+            assert_ne!(VirtualProtect((p + PAGE) as *const _, PAGE, PAGE_READONLY, &mut old), 0);
+            assert_ne!(VirtualFree((p + 2 * PAGE) as *mut _, PAGE, MEM_DECOMMIT), 0);
+        }
+        // The count left may be more than is (a fast string copy reports
+        // where it last took stock); what it says is done, is.
+        // SAFETY: as above.
+        let left = unsafe { store(p as *mut u8, from.as_ptr(), 3 * PAGE) };
+        assert!((2 * PAGE..=3 * PAGE).contains(&left), "left {left}");
+        let done = 3 * PAGE - left;
+        // SAFETY: the first page is committed.
+        let first = unsafe { std::slice::from_raw_parts(p as *const u8, done) };
+        assert_eq!(first, &from[..done]);
+        // SAFETY: as above.
+        unsafe {
+            assert_ne!(VirtualProtect((p + PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old), 0);
+        }
+        // SAFETY: as above.
+        let left = unsafe { store((p + PAGE + 4) as *mut u8, from.as_ptr(), 2 * PAGE - 8) };
+        assert!((PAGE - 4..=2 * PAGE - 8).contains(&left), "left {left}");
+        // A title's own guard page stops it too (and is spent, as a kernel
+        // copy's probe spends it).
+        // SAFETY: as above.
+        unsafe {
+            assert_ne!(
+                VirtualProtect((p + PAGE) as *const _, PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old),
+                0
+            );
+        }
+        // SAFETY: as above.
+        let left = unsafe { store((p + PAGE) as *mut u8, from.as_ptr(), 16) };
+        assert_eq!(left, 16);
         free(p);
     }
 

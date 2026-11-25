@@ -528,9 +528,31 @@ impl Shadow {
             return 0;
         }
         if !runs.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::MarkedRuns, runs.len() as u64);
             let _writing = crate::watch::writing(from, n);
+            // Once a store fails (the page went, or is read-only not by our
+            // guards), the rest go through the kernel, as far as mapped:
+            // faulting again for each run would cost more.
+            let mut stores = true;
             for &(a, b) in &runs {
-                crate::host::write_mapped((from + a) as *mut u8, host[a..].as_ptr(), b - a);
+                let mut done = 0;
+                if stores {
+                    // SAFETY: `host[a..b]` is ours; the destination is the
+                    // title's page, which `store` stops at if it went.
+                    let left = unsafe {
+                        crate::watch::store((from + a) as *mut u8, host[a..].as_ptr(), b - a)
+                    };
+                    done = b - a - left;
+                    stores = left == 0;
+                }
+                if done < b - a {
+                    crate::host::write_mapped(
+                        (from + a + done) as *mut u8,
+                        host[a + done..].as_ptr(),
+                        b - a - done,
+                    );
+                }
             }
         }
         // The copy takes the title's bytes, the shaders' among them. The
