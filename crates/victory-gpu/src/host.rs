@@ -342,11 +342,27 @@ fn log_gpu_times(frames: f64) {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod memory_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Optional override for `video_memory()` on the current test thread.
+        pub(crate) static MEMORY: Cell<Option<[(f64, f64); 2]>> = const { Cell::new(None) };
+        /// Forces `D3D12_HEAP_TYPE_GPU_UPLOAD` allocations to fail on the current test thread.
+        pub(crate) static VIDEO_FULL: Cell<bool> = const { Cell::new(false) };
+    }
+}
+
 /// Diagnostics: the host device's video memory use and budget, in MB, local
 /// (on the card) and non-local (system memory the GPU reads), as the
 /// system's memory manager sees them: use over budget makes it page
 /// allocations at submissions.
 pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
+    #[cfg(test)]
+    if let Some(m) = memory_override::MEMORY.with(std::cell::Cell::get) {
+        return Some(m);
+    }
     static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
     let adapter = ADAPTER
         .get_or_init(|| {
@@ -2649,8 +2665,71 @@ mod title_copies {
     }
 }
 
+/// Share of the card's local video-memory budget below which write-only upload
+/// buffers are placed in `D3D12_HEAP_TYPE_GPU_UPLOAD` (10% headroom below
+/// `resource.rs`'s 90% texture eviction threshold).
+const GPU_UPLOAD_BUDGET: f64 = 0.80;
+
+/// Empty CPU read range for `ID3D12Resource::Map` on write-only upload buffers.
+const NO_CPU_READ: D3D12_RANGE = D3D12_RANGE { Begin: 0, End: 0 };
+
+fn local_below_budget(memory: Option<[(f64, f64); 2]>, limit: f64, bytes: u64) -> bool {
+    memory.is_some_and(|[(used, budget), _]| {
+        budget > 0.0 && used + bytes as f64 / 1e6 < limit * budget
+    })
+}
+
+fn local_below(limit: f64, bytes: u64) -> bool {
+    local_below_budget(video_memory(), limit, bytes)
+}
+
 impl Host {
-    /// A buffer in the upload heap, mapped for writing.
+    /// Whether the adapter supports `D3D12_HEAP_TYPE_GPU_UPLOAD` (CPU-mappable
+    /// video memory, i.e. ReBAR / SAM).
+    pub(crate) fn gpu_upload_heap(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok()
+                && options.GPUUploadHeapSupported.as_bool();
+            tracing::debug!(gpu_upload = ok, "host GPU upload heap");
+            ok
+        })
+    }
+
+    fn make_mapped(
+        &self,
+        heap: &D3D12_HEAP_PROPERTIES,
+        desc: &D3D12_RESOURCE_DESC,
+        state: D3D12_RESOURCE_STATES,
+        read_range: Option<&D3D12_RANGE>,
+    ) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
+        #[cfg(test)]
+        if heap.Type == D3D12_HEAP_TYPE_GPU_UPLOAD
+            && memory_override::VIDEO_FULL.with(std::cell::Cell::get)
+        {
+            return Err(windows::Win32::Foundation::E_OUTOFMEMORY.into());
+        }
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and persistent mapping of a buffer.
+        unsafe {
+            self.device
+                .CreateCommittedResource(heap, D3D12_HEAP_FLAG_NONE, desc, state, None, &mut buffer)?;
+            let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+            b.Map(0, read_range.map(std::ptr::from_ref), Some(&mut data))?;
+        }
+        Ok((buffer.ok_or_else(windows::core::Error::empty)?, data.cast()))
+    }
+
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
     pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
@@ -2682,11 +2761,15 @@ impl Host {
         made.ok().and(buffer)
     }
 
+    /// A buffer mapped for CPU writes and GPU reads: in video memory
+    /// (`GPU_UPLOAD`, `COMMON` state) when supported and the card's own use is
+    /// below [`GPU_UPLOAD_BUDGET`], else in system upload memory (`UPLOAD`).
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         self.mapped_buffer(size, false)
     }
 
-    /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
+    /// A mapped buffer of `size` bytes: upload memory (preferring `GPU_UPLOAD`
+    /// while local VRAM is below [`GPU_UPLOAD_BUDGET`]), or (`readback`)
     /// readback memory in the copy-destination state.
     fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
@@ -2706,26 +2789,16 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    if readback { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_GENERIC_READ },
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
+        if !readback && self.gpu_upload_heap() && local_below(GPU_UPLOAD_BUDGET, size) {
+            let gpu = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() };
+            if let Ok(made) = self.make_mapped(&gpu, &desc, D3D12_RESOURCE_STATE_COMMON, Some(&NO_CPU_READ)) {
+                return Some(made);
+            }
+        }
+        let state = if readback { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_GENERIC_READ };
+        let read_range = (!readback).then_some(&NO_CPU_READ);
+        match self.make_mapped(&heap, &desc, state, read_range) {
+            Ok(made) => Some(made),
             Err(e) => {
                 tracing::warn!(error = %e, size, readback, "no mapped buffer");
                 None
@@ -3160,17 +3233,7 @@ impl Host {
             if !crate::switch::on("VICTORY_COPIES_IN_VIDEO_MEMORY") {
                 return false;
             }
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
-            // SAFETY: the query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device.CheckFeatureSupport(
-                    D3D12_FEATURE_D3D12_OPTIONS16,
-                    (&raw mut options).cast(),
-                    size_of_val(&options) as u32,
-                )
-            }
-            .is_ok()
-                && options.GPUUploadHeapSupported.as_bool();
+            let ok = self.gpu_upload_heap();
             tracing::warn!(on = ok, "host copies of title memory in video memory (diagnostics)");
             ok
         })
@@ -3578,5 +3641,72 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod upload_placement {
+    use super::*;
+
+    #[test]
+    fn local_below_budget_checks_headroom_and_bounds() {
+        let mem = |used: f64, budget: f64| Some([(used, budget), (1000.0, 7600.0)]);
+        assert!(local_below_budget(mem(4000.0, 16000.0), 0.80, 64 << 10));
+        assert!(!local_below_budget(mem(12800.0, 16000.0), 0.80, 0), "exact 80% is not below");
+        assert!(!local_below_budget(mem(12799.0, 16000.0), 0.80, 2_000_000), "size crosses 80%");
+        assert!(!local_below_budget(mem(13500.0, 16000.0), 0.80, 64 << 10));
+        assert!(!local_below_budget(None, 0.80, 64 << 10));
+        assert!(!local_below_budget(mem(0.0, 0.0), 0.80, 64 << 10));
+    }
+
+    #[test]
+    fn upload_buffers_use_gpu_upload_below_budget_and_fall_back_to_upload() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        if !host.gpu_upload_heap() {
+            return; // no ReBAR / GPU upload heap on this adapter
+        }
+        let heap_type = |r: &ID3D12Resource| -> D3D12_HEAP_TYPE {
+            let mut props = D3D12_HEAP_PROPERTIES::default();
+            // SAFETY: plain heap query on a live buffer.
+            unsafe { r.GetHeapProperties(Some(&mut props), None).unwrap() };
+            props.Type
+        };
+
+        // Below 80% local budget: placed in GPU_UPLOAD (COMMON state) and readable by GPU copy.
+        memory_override::MEMORY.with(|m| m.set(Some([(4000.0, 16000.0), (1000.0, 7600.0)])));
+        let (up, data) = host.upload_buffer(64 << 10).expect("gpu upload buffer");
+        memory_override::MEMORY.with(|m| m.set(None));
+        assert_eq!(heap_type(&up), D3D12_HEAP_TYPE_GPU_UPLOAD);
+
+        let pattern = [0x1122_3344u32, 0x5566_7788, 0x99aa_bbcc, 0xddee_ff00];
+        let list = host.new_list().unwrap();
+        let (rb, rb_data) = list.readback(host, 64).unwrap();
+        assert_eq!(heap_type(&rb), D3D12_HEAP_TYPE_READBACK);
+        // SAFETY: mapped upload buffer written on CPU, copied on GPU to readback, then read.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), data.cast::<u32>(), pattern.len());
+            list.list.CopyBufferRegion(&rb, 0, &up, 0, 16);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: GPU finished copying into readback buffer.
+        let got = unsafe { std::slice::from_raw_parts(rb_data.cast::<u32>(), pattern.len()) };
+        assert_eq!(got, &pattern);
+
+        // Above 80% local budget: stays in system UPLOAD.
+        memory_override::MEMORY.with(|m| m.set(Some([(13500.0, 16000.0), (1000.0, 7600.0)])));
+        let (sys_up, _) = host.upload_buffer(64 << 10).expect("system upload buffer");
+        memory_override::MEMORY.with(|m| m.set(None));
+        assert_eq!(heap_type(&sys_up), D3D12_HEAP_TYPE_UPLOAD);
+
+        // Simulated VRAM allocation failure below 80%: falls back cleanly to system UPLOAD.
+        memory_override::MEMORY.with(|m| m.set(Some([(4000.0, 16000.0), (1000.0, 7600.0)])));
+        memory_override::VIDEO_FULL.with(|f| f.set(true));
+        let (fallback, _) = host.upload_buffer(64 << 10).expect("fallback upload buffer");
+        memory_override::VIDEO_FULL.with(|f| f.set(false));
+        memory_override::MEMORY.with(|m| m.set(None));
+        assert_eq!(heap_type(&fallback), D3D12_HEAP_TYPE_UPLOAD);
     }
 }
