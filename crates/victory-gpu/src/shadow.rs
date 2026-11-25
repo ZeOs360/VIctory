@@ -435,7 +435,14 @@ impl Shadow {
     /// they changed is what differs from the copy's bytes before the
     /// submission: title memory where the title has not written the page
     /// since the copy took it, else what the page held when the title first
-    /// wrote it ([`crate::watch::Tracked::saved`], if the page was armed).
+    /// wrote it ([`crate::watch::Tracked::finish`], if the page was armed).
+    /// Only the runs of bytes the shaders changed are written: the title's
+    /// threads write the same pages meanwhile (its records share the GPU
+    /// heap), and putting the copy's older bytes back over theirs broke them
+    /// (a fence list read as -1, as in [`Shadow::copy_back`]). The runs are
+    /// written with plain stores ([`crate::watch::store`]): in the world
+    /// they are millions a frame, a few bytes each, and a system call apiece
+    /// cost seconds.
     /// Returns the bytes written.
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
@@ -449,47 +456,91 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        // Our own write below must not save the page for this copy again.
-        t.unarm(page / PAGE);
-        let saved = t.saved(page / PAGE);
-        if saved.is_none() && t.changed(page / PAGE) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::MarkedKept, 1);
-            return 0;
-        }
         let n = to - from;
-        // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
+        // Read while still armed: a title write landing meanwhile keeps the
+        // page's bytes from before it (then they, not these, tell what the
+        // shaders changed).
         let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
+        let read = crate::host::read_into(from as *const u8, &mut title);
+        #[cfg(test)]
+        tests::run_after_marked_read();
+        // Our own write below must not save the page for this copy again.
+        let finished = t.finish(page / PAGE);
+        if !read {
             return 0;
         }
-        let written = match &saved {
-            // The title's bytes are the copy's from before: what differs is
-            // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
-            Some(before) => {
-                let before = &before[from - page..to - page];
-                let mut changed = false;
-                for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
-                    if *h != *b && *t != *h {
-                        *t = *h;
-                        changed = true;
-                    }
-                    *h = *t;
-                }
-                changed.then_some(title.as_ptr())
+        let saved = match finished {
+            crate::watch::Finished::Untouched => None,
+            crate::watch::Finished::Saved(bytes) => Some(bytes),
+            crate::watch::Finished::Unsaved => {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::MarkedKept, 1);
+                return 0;
             }
         };
-        if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
+        // SAFETY: inside the mapping; only the submitting thread writes it.
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
+        let before: &[u8] = match &saved {
+            Some(bytes) => &bytes[from - page..to - page],
+            None => &title,
+        };
+        // The runs of bytes the shaders changed.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (i, (h, b)) in host.iter().zip(before).enumerate() {
+            if h != b {
+                match runs.last_mut() {
+                    Some((_, end)) if *end == i => *end = i + 1,
+                    _ => runs.push((i, i + 1)),
+                }
+            }
         }
-        // Equal to title memory now: taken, unless it holds the page in part.
+        if runs.is_empty() && saved.is_none() {
+            // Untouched and unchanged: still guarded, and equal to the copy.
+            return 0;
+        }
+        if !runs.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::MarkedRuns, runs.len() as u64);
+            let _writing = crate::watch::writing(from, n);
+            // Once a store fails (the page went, or is read-only not by our
+            // guards), the rest go through the kernel, as far as mapped:
+            // faulting again for each run would cost more.
+            let mut stores = true;
+            for &(a, b) in &runs {
+                let mut done = 0;
+                if stores {
+                    // SAFETY: `host[a..b]` is ours; the destination is the
+                    // title's page, which `store` stops at if it went.
+                    let left = unsafe {
+                        crate::watch::store((from + a) as *mut u8, host[a..].as_ptr(), b - a)
+                    };
+                    done = b - a - left;
+                    stores = left == 0;
+                }
+                if done < b - a {
+                    crate::host::write_mapped(
+                        (from + a + done) as *mut u8,
+                        host[a + done..].as_ptr(),
+                        b - a - done,
+                    );
+                }
+            }
+        }
+        // The copy takes the title's bytes, the shaders' among them.
+        for &(a, b) in &runs {
+            title[a..b].copy_from_slice(&host[a..b]);
+        }
+        // A copy holding the whole page takes it: guarded first and read
+        // again after, so a title write before the guard is in what is read,
+        // and one after it marks the page changed again. One holding it in
+        // part leaves it changed (the next update copies it).
         if from == page && to == page + PAGE {
             t.taken(&[page / PAGE]);
+            // Where the page cannot be read, the bytes merged above stay.
+            crate::host::read_into(from as *const u8, &mut title);
         }
-        written.map_or(0, |_| n)
+        host.copy_from_slice(&title);
+        runs.iter().map(|(a, b)| b - a).sum()
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -1569,5 +1620,69 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    thread_local! {
+        /// Run inside [`Shadow::copy_back_marked`] right after it read the
+        /// page: a title write landing there, on this thread, at a known
+        /// point.
+        static AFTER_MARKED_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_after_marked_read() {
+        if let Some(hook) = AFTER_MARKED_READ.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// A title write to a marked page while its copy-back runs (after the
+    /// copy-back read it, before it wrote) stays: only the bytes the shader
+    /// changed go back. Writing the copy's whole page put its older bytes
+    /// back over the title's (a fence list read as -1).
+    #[test]
+    fn marked_copy_back_keeps_a_title_write_made_meanwhile() {
+        let p = crate::watch::tests::pool(1);
+        let len = PAGE;
+        let title = move |at: usize| (p + at) as *mut u8;
+        // SAFETY: (title writes and reads below) bytes of our pool.
+        unsafe {
+            for i in 0..4 {
+                title(200 + i).write_volatile(0xff);
+            }
+        }
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        // The shader writes at 16; the copy still holds -1 at 200.
+        copy.write_host((p + 16) as u64, &[0xaa, 0xbb, 0xcc, 0xdd]);
+        AFTER_MARKED_READ.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                for (i, b) in [0x11u8, 0x22, 0x33, 0x44].into_iter().enumerate() {
+                    // SAFETY: our pool, guarded: the handler opens the page.
+                    unsafe { title(200 + i).write_volatile(b) };
+                }
+            }));
+        });
+        let written = copy.copy_back_marked(p);
+        let hook_ran = AFTER_MARKED_READ.with(|h| h.borrow_mut().take()).is_none();
+        // SAFETY: as above.
+        let read = |at: usize| [0, 1, 2, 3].map(|i| unsafe { title(at + i).read_volatile() });
+        let (gpu, title_bytes) = (read(16), read(200));
+        let host = copy.read_host((p + 200) as u64, 1);
+        copy.copy_back(p, len);
+        unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+        assert!(hook_ran, "the title write ran inside the copy-back");
+        assert_eq!(written, 4, "the shader's bytes alone go back");
+        assert_eq!(gpu, [0xaa, 0xbb, 0xcc, 0xdd], "the shader's bytes");
+        assert_eq!(title_bytes, [0x11, 0x22, 0x33, 0x44], "the title's write stays");
+        assert_eq!(host, [0x4433_2211], "the copy takes the title's bytes");
     }
 }
