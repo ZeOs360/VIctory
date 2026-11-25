@@ -2236,7 +2236,7 @@ impl HostList {
         if let Some(b) = arguments.as_ref().filter(|b| unsafe { b.GetDesc() }.Width >= bytes) {
             return Some(b.clone());
         }
-        let (made, _) = host()?.shared_buffer(bytes.next_power_of_two().max(1 << 16))?;
+        let made = host()?.uav_buffer(bytes.next_power_of_two().max(1 << 16))?;
         name(&made, || "indirect arguments".into());
         // Commands recorded earlier may still name the smaller one.
         if let Some(old) = arguments.replace(made.clone()) {
@@ -2730,8 +2730,12 @@ impl Host {
         Ok((buffer.ok_or_else(windows::core::Error::empty)?, data.cast()))
     }
 
-    /// A GPU-only buffer of `size` bytes in the copy-destination state.
-    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+    fn default_buffer_with(
+        &self,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
@@ -2744,6 +2748,7 @@ impl Host {
             MipLevels: 1,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
@@ -2753,12 +2758,32 @@ impl Host {
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
+                state,
                 None,
                 &mut buffer,
             )
         };
-        made.ok().and(buffer)
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no default buffer");
+                None
+            }
+        }
+    }
+
+    /// A GPU-only buffer of `size` bytes in the copy-destination state.
+    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.default_buffer_with(size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)
+    }
+
+    /// A GPU-only buffer of `size` bytes for unordered access, in the common state.
+    pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.default_buffer_with(
+            size,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        )
     }
 
     /// A buffer mapped for CPU writes and GPU reads: in video memory

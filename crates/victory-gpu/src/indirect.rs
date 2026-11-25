@@ -270,6 +270,35 @@ mod tests {
         assert!(super::clamp().is_some());
     }
 
+    /// Reads `words` dwords from a `COMMON`-state GPU-only buffer through a
+    /// readback list, leaving `buffer` back in `COMMON`.
+    fn read_words(host: &crate::host::Host, buffer: &super::ID3D12Resource, words: usize) -> Vec<u32> {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        };
+        let bytes = (words * 4) as u64;
+        let list = host.new_list().unwrap();
+        let (rb, data) = list.readback(host, bytes.max(4)).unwrap();
+        // SAFETY: an open list and live buffers in the states named.
+        unsafe {
+            list.list.ResourceBarrier(&[super::transition(
+                buffer,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&rb, 0, buffer, 0, bytes);
+            list.list.ResourceBarrier(&[super::transition(
+                buffer,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the readback copy has finished on the GPU.
+        unsafe { std::slice::from_raw_parts(data.cast::<u32>(), words).to_vec() }
+    }
+
     /// Clamps `records` records of `kind`, filled by repeating `words`,
     /// `calls` times in one list: each record's first word in the list's
     /// argument buffer after (zero when it runs empty). The title's copy,
@@ -290,7 +319,7 @@ mod tests {
         let list = host.new_list().unwrap();
         // SAFETY: our mapped buffer, written before the list runs and read
         // after it has; a live buffer.
-        unsafe {
+        let out = unsafe {
             for at in 0..all {
                 data.add(at).write_volatile(words[at % words.len()]);
             }
@@ -306,11 +335,10 @@ mod tests {
             for at in 0..all {
                 assert_eq!(data.add(at).read_volatile(), words[at % words.len()], "the title's copy as written");
             }
-            let mut out_data = std::ptr::null_mut();
-            out?.Map(0, None, Some(&mut out_data)).unwrap();
-            let first = |i: usize| out_data.cast::<u32>().add(i * per).read_volatile();
-            Some((0..records as usize).map(first).collect())
-        }
+            out?
+        };
+        let out_words = read_words(host, &out, records as usize * per);
+        Some((0..records as usize).map(|i| out_words[i * per]).collect())
     }
 
     /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
@@ -395,13 +423,22 @@ mod tests {
             assert!(run.iter().all(|t| t.0 != key(&title)), "the title's copy is never transitioned");
             assert!(states.values().all(|&s| s == 0), "all common again");
             for (out, _) in &recorded {
-                let mut p = std::ptr::null_mut();
-                // SAFETY: a mapped buffer of ours, the lists have run.
-                let clamped = unsafe {
-                    out.Map(0, None, Some(&mut p)).unwrap();
-                    p.cast::<[u32; 3]>().read_volatile()
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 };
-                assert_eq!(clamped, [65_535, 1, 1]);
+                let mut props = D3D12_HEAP_PROPERTIES::default();
+                // SAFETY: plain queries on a live buffer.
+                let desc = unsafe {
+                    out.GetHeapProperties(Some(&mut props), None).unwrap();
+                    out.GetDesc()
+                };
+                assert_eq!(props.Type, D3D12_HEAP_TYPE_DEFAULT, "argument buffer is GPU-only");
+                assert!(
+                    desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                    "argument buffer allows UAV writes"
+                );
+                assert_eq!(read_words(host, out, 3), [65_535, 1, 1]);
             }
             // SAFETY: as above.
             assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");
