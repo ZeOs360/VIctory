@@ -444,6 +444,8 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::MarkedKept, 1);
             return 0;
         }
+        #[cfg(test)]
+        tests::run_after_marked_changed_check();
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
@@ -1157,5 +1159,160 @@ mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    thread_local! {
+        /// Test-only hook run inside [`Shadow::copy_back_marked`] right after
+        /// its `t.changed` check and before `read_into` / `write_mapped`, to
+        /// inject a concurrent title write deterministically on this thread.
+        static AFTER_MARKED_CHANGED_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_after_marked_changed_check() {
+        if let Some(hook) = AFTER_MARKED_CHANGED_CHECK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    struct AfterChangedHook;
+
+    impl AfterChangedHook {
+        fn install(f: impl FnOnce() + 'static) -> Self {
+            AFTER_MARKED_CHANGED_CHECK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+            Self
+        }
+    }
+
+    impl Drop for AfterChangedHook {
+        fn drop(&mut self) {
+            AFTER_MARKED_CHANGED_CHECK.with(|h| h.borrow_mut().take());
+        }
+    }
+
+    /// Candidate C1: a sub-page refresh of a multi-page tracked copy leaves
+    /// that page in `changed` (`Tracked::take` only un-changes pages covered
+    /// whole). When a shader marks a write to that page, `copy_back_marked`
+    /// must still put the shader's bytes into title memory without clobbering
+    /// unrelated title bytes on the same page.
+    #[test]
+    fn marked_writes_on_a_partially_refreshed_page_go_back() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        let title = |at: usize| (p + at) as *mut u8;
+        // Start with both pages taken and guarded.
+        copy.update(p, len);
+        // Before the submission, the title writes sentinel bytes inside a
+        // 64-byte sub-page UAV on page 1 and another record elsewhere on the
+        // same page: page 1 faults into `changed`.
+        // SAFETY: bytes of our pool, guarded read-only (handler opens page 1).
+        unsafe {
+            for i in 0..4 {
+                title(PAGE + 16 + i).write_volatile(0xff);
+            }
+            title(PAGE + 200).write_volatile(0x33);
+        }
+        let tracked = copy.tracked.as_ref().expect("pool memory is tracked");
+        assert!(tracked.changed(p / PAGE + 1), "title write marks page 1 changed");
+        // Submission prepares only the 64-byte UAV [PAGE + 16, PAGE + 80):
+        // `Tracked::take` copies those 64 bytes into the copy, but leaves
+        // page 1 in `changed` and unguarded because it was not covered whole.
+        assert_eq!(copy.update(p + PAGE + 16, 64), 64);
+        assert_eq!(copy.read_host((p + PAGE + 16) as u64, 1), [0xffff_ffff]);
+        assert!(tracked.changed(p / PAGE + 1), "partial refresh leaves page 1 changed");
+        // Marked UAV write declared: arms page 1 and keeps no `before` snapshot.
+        copy.writing(p + PAGE + 16, 64, true);
+        assert!(copy.before.lock().unwrap().0.is_empty(), "no snapshot");
+        let base = copy.marks.expect("tracked memory gets mark bits");
+        assert_eq!(copy.mark_entry((p + PAGE + 16) as u64), Some((base + 1, 16)));
+        // The shader writes its result into the UAV on page 1 and marks it.
+        copy.write_host((p + PAGE + 16) as u64, &[0xaa, 0xbb, 0xcc, 0xdd]);
+        // Post-submission copy-back (`copy_back_marked`, then `copy_back`).
+        let written = copy.copy_back_marked(p + PAGE);
+        let fallback = copy.copy_back(p + PAGE + 16, 64);
+        // SAFETY: bytes of our pool.
+        let uav_bytes = [0, 1, 2, 3].map(|i| unsafe { title(PAGE + 16 + i).read_volatile() });
+        // SAFETY: a byte of our pool.
+        let other_byte = unsafe { title(PAGE + 200).read_volatile() };
+        unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+        assert_eq!(other_byte, 0x33, "unrelated title byte on page 1 stays intact");
+        assert_eq!(
+            uav_bytes,
+            [0xaa, 0xbb, 0xcc, 0xdd],
+            "marked GPU write on a partially refreshed page must reach title memory \
+             (copy_back_marked returned {written} bytes, copy_back returned {fallback} bytes)"
+        );
+        assert!(written + fallback > 0, "the shader's write must be copied back");
+    }
+
+    /// Candidate C2: a title write to a marked page that lands after
+    /// `copy_back_marked`'s `t.changed` check and before `write_mapped` must
+    /// survive; the `saved == None` arm must not overwrite it with stale bytes
+    /// from the host copy.
+    #[test]
+    fn marked_copy_back_does_not_overwrite_a_concurrent_title_write() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let p = crate::watch::tests::pool(1);
+        let len = PAGE;
+        let title = |at: usize| (p + at) as *mut u8;
+        // Title memory starts with a stale sentinel (-1) at offset 200.
+        // SAFETY: bytes of our pool.
+        unsafe {
+            for i in 0..4 {
+                title(200 + i).write_volatile(0xff);
+            }
+        }
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        // Full refresh takes and guards the page; host now mirrors 0xff at 200.
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        assert!(copy.before.lock().unwrap().0.is_empty(), "no snapshot");
+        // Shader writes only at offset 16 (leaving offset 200 stale at 0xff).
+        copy.write_host((p + 16) as u64, &[0xaa, 0xbb, 0xcc, 0xdd]);
+        // Inject a title write at offset 200 right after `t.changed` returns
+        // false inside `copy_back_marked` and before `read_into` / `write_mapped`.
+        let injected = Arc::new(AtomicBool::new(false));
+        let injected_flag = injected.clone();
+        let _hook = AfterChangedHook::install(move || {
+            // SAFETY: bytes of our pool, still guarded read-only: faults into
+            // the guard handler, which opens the page and marks it changed.
+            for (i, b) in [0x11u8, 0x22, 0x33, 0x44].into_iter().enumerate() {
+                unsafe { ((p + 200 + i) as *mut u8).write_volatile(b) };
+            }
+            injected_flag.store(true, Ordering::Relaxed);
+        });
+        let written = copy.copy_back_marked(p);
+        drop(_hook);
+        let changed_after = copy.tracked.as_ref().expect("tracked").changed(p / PAGE);
+        // SAFETY: bytes of our pool.
+        let gpu_bytes = [0, 1, 2, 3].map(|i| unsafe { title(16 + i).read_volatile() });
+        // SAFETY: bytes of our pool.
+        let title_bytes = [0, 1, 2, 3].map(|i| unsafe { title(200 + i).read_volatile() });
+        copy.copy_back(p, len);
+        unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+        assert!(injected.load(Ordering::Relaxed), "test hook must run inside copy_back_marked");
+        assert!(written > 0, "the shader's write must be copied back");
+        assert_eq!(gpu_bytes, [0xaa, 0xbb, 0xcc, 0xdd], "the shader's write goes back");
+        assert_eq!(
+            title_bytes,
+            [0x11, 0x22, 0x33, 0x44],
+            "title write landing after t.changed must survive copy_back_marked \
+             (changed after copy_back_marked = {changed_after})"
+        );
     }
 }
