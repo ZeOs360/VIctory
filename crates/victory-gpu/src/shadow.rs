@@ -486,16 +486,7 @@ impl Shadow {
             Some(bytes) => &bytes[from - page..to - page],
             None => &title,
         };
-        // The runs of bytes the shaders changed.
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for (i, (h, b)) in host.iter().zip(before).enumerate() {
-            if h != b {
-                match runs.last_mut() {
-                    Some((_, end)) if *end == i => *end = i + 1,
-                    _ => runs.push((i, i + 1)),
-                }
-            }
-        }
+        let runs = changed_runs(host, before);
         if runs.is_empty() && saved.is_none() {
             // Untouched and unchanged: still guarded, and equal to the copy.
             return 0;
@@ -894,6 +885,30 @@ pub(crate) fn reads_since() -> Vec<u32> {
 /// marked again.
 pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
+}
+
+/// The runs `[from, to)` of bytes where `now` differs from `before` (as
+/// long as each other), in order. Compared a block at a time first: in the
+/// world most of a marked page is unchanged, and a byte at a time cost
+/// about half of its copy-back.
+fn changed_runs(now: &[u8], before: &[u8]) -> Vec<(usize, usize)> {
+    const BLOCK: usize = 64;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (k, (n, b)) in now.chunks(BLOCK).zip(before.chunks(BLOCK)).enumerate() {
+        if n == b {
+            continue;
+        }
+        for (j, (x, y)) in n.iter().zip(b).enumerate() {
+            if x != y {
+                let i = k * BLOCK + j;
+                match runs.last_mut() {
+                    Some((_, end)) if *end == i => *end = i + 1,
+                    _ => runs.push((i, i + 1)),
+                }
+            }
+        }
+    }
+    runs
 }
 
 /// After a submission: every page its shaders marked as written through
@@ -1650,6 +1665,49 @@ pub(crate) mod tests {
         if let Some((_, f)) = hook {
             f();
         }
+    }
+
+    /// The runs found a block at a time are those a byte at a time finds:
+    /// across block edges, at the ends, in a length no multiple of a block.
+    #[test]
+    fn changed_runs_are_those_byte_by_byte() {
+        let byte_by_byte = |now: &[u8], before: &[u8]| {
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for (i, (x, y)) in now.iter().zip(before).enumerate() {
+                if x != y {
+                    match runs.last_mut() {
+                        Some((_, end)) if *end == i => *end = i + 1,
+                        _ => runs.push((i, i + 1)),
+                    }
+                }
+            }
+            runs
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for len in [0, 1, 63, 64, 65, 200, PAGE - 3, PAGE] {
+            let before: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            for density in [0, 1, 8, 128, 256] {
+                let mut now = before.clone();
+                for b in &mut now {
+                    if (next() % 256) < density {
+                        *b = b.wrapping_add(1);
+                    }
+                }
+                assert_eq!(changed_runs(&now, &before), byte_by_byte(&now, &before), "{len} bytes, {density}");
+            }
+        }
+        // A run across a block edge, and one ending the slice.
+        let before = vec![0u8; 130];
+        let mut now = before.clone();
+        now[60..70].fill(1);
+        now[129] = 1;
+        assert_eq!(changed_runs(&now, &before), [(60, 70), (129, 130)]);
     }
 
     /// A title write to a marked page while its copy-back runs stays: only
