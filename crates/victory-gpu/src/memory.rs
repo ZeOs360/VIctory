@@ -433,11 +433,133 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     }
 }
 
+/// Bits, dwords, and byte size of one per-list "title memory written pages"
+/// bitmap: 513 blocks of 4,096 pages = 262,656 bytes, always in CPU-cached
+/// system memory (`shared_buffer`) because the CPU scans it after every
+/// submission.
+const BITMAP_BITS: usize = (CAPACITY + 1) * BLOCK;
+const BITMAP_WORDS: usize = BITMAP_BITS / 32;
+const BITMAP_BYTES: u64 = (BITMAP_BITS / 8).next_multiple_of(256) as u64;
+/// Bitmaps pre-allocated on first use while system memory for the GPU is free
+/// (~4.2 MB), so title-memory binds keep working when system memory later fills.
+const BITMAP_PREWARM: usize = 16;
+/// Upper bound on idle pooled bitmaps (~16.8 MB), matching `list::SPARE`'s cap.
+const BITMAP_POOL_MAX: usize = 64;
+
+/// A reusable per-list dirty-page bitmap buffer in system memory.
+struct Bitmap {
+    _buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the persistent CPU mapping lives
+// as long as `_buffer`, and a leased `Bitmap` belongs to one list at a time.
+unsafe impl Send for Bitmap {}
+// SAFETY: as above; `defer_missed` and `defer_after` run sequentially on the
+// submitting thread after the GPU fence wait.
+unsafe impl Sync for Bitmap {}
+
+/// Bounded LIFO pool of idle [`Bitmap`] buffers.
+struct BitmapPool {
+    free: Vec<Bitmap>,
+    cap: usize,
+}
+
+impl BitmapPool {
+    const fn new(cap: usize) -> Self {
+        Self { free: Vec::new(), cap }
+    }
+
+    fn take(&mut self) -> Option<Bitmap> {
+        self.free.pop()
+    }
+
+    fn put(&mut self, bitmap: Bitmap) {
+        if self.free.len() < self.cap {
+            self.free.push(bitmap);
+        }
+    }
+}
+
+static BITMAP_POOL: std::sync::LazyLock<Arc<Mutex<BitmapPool>>> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(BitmapPool::new(BITMAP_POOL_MAX))));
+
+/// A bitmap leased to one `HostList`: held by its `defer_missed` and
+/// `defer_after` closures until `HostList::reset` (or `HostList` drop) drops
+/// `Deferred` after the list's last submission has finished on the GPU, then
+/// returned to `pool`.
+struct BitmapLease {
+    bitmap: Option<Bitmap>,
+    pool: Arc<Mutex<BitmapPool>>,
+}
+
+impl BitmapLease {
+    fn data(&self) -> usize {
+        self.bitmap.as_ref().expect("live until drop").data
+    }
+
+    fn gpu(&self) -> u64 {
+        self.bitmap.as_ref().expect("live until drop").gpu
+    }
+}
+
+impl Drop for BitmapLease {
+    fn drop(&mut self) {
+        if let Some(bitmap) = self.bitmap.take() {
+            self.pool.lock().unwrap_or_else(|e| e.into_inner()).put(bitmap);
+        }
+    }
+}
+
+fn alloc_bitmap() -> Option<Bitmap> {
+    let (buffer, data) = crate::host::host()?.shared_buffer(BITMAP_BYTES)?;
+    crate::host::name(&buffer, || "title memory written pages".into());
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    Some(Bitmap { _buffer: buffer, data: data as usize, gpu })
+}
+
+fn prewarm_bitmaps() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut made = Vec::with_capacity(BITMAP_PREWARM);
+        for _ in 0..BITMAP_PREWARM {
+            match alloc_bitmap() {
+                Some(b) => made.push(b),
+                None => break,
+            }
+        }
+        let mut pool = BITMAP_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        for b in made {
+            pool.put(b);
+        }
+    });
+}
+
+fn take_bitmap(pool: &Arc<Mutex<BitmapPool>>) -> Option<Arc<BitmapLease>> {
+    let bitmap = {
+        let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+        p.take()
+    }
+    .or_else(alloc_bitmap)?;
+    // SAFETY: our mapped buffer of at least `BITMAP_WORDS` dwords, owned
+    // exclusively by this lease (not in use by the GPU or any other list).
+    unsafe { std::ptr::write_bytes(bitmap.data as *mut u32, 0, BITMAP_WORDS) };
+    Some(Arc::new(BitmapLease { bitmap: Some(bitmap), pool: pool.clone() }))
+}
+
 /// `list` uses title memory with view heap `key` bound: the heap's page
-/// table (made on first use) and a page bitmap of the list's, the table
-/// brought up to date at each submission of the list, its written pages
-/// copied back after.
+/// table (made on first use) and a page bitmap of the list's (taken from
+/// [`BITMAP_POOL`] and returned when the list resets), the table brought up
+/// to date at each submission of the list, its written pages copied back
+/// after.
 pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
+    prewarm_bitmaps();
+    bind_from(list, key, &BITMAP_POOL)
+}
+
+fn bind_from(list: &HostList, key: usize, pool: &Arc<Mutex<BitmapPool>>) -> Option<Map> {
     let table = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
@@ -454,23 +576,18 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         Some(gpu)
     })
     .flatten()?;
-    let bits = (CAPACITY + 1) * BLOCK;
-    let (bitmap, data) = crate::host::host()?.shared_buffer((bits / 8).next_multiple_of(256) as u64)?;
-    crate::host::name(&bitmap, || "title memory written pages".into());
-    let words = bits / 32;
-    // SAFETY: our mapped buffer of at least `words` dwords.
-    unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
-    // SAFETY: a live buffer.
-    let dirty = unsafe { bitmap.GetGPUVirtualAddress() };
-    list.keep(&bitmap);
+    let lease = take_bitmap(pool)?;
+    let dirty = lease.gpu();
+    let words = BITMAP_WORDS;
     list.defer_memory(key);
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
-    let data = data as usize;
+    let missed_lease = lease.clone();
     list.defer_missed(move || {
         let l = layout(key);
-        // SAFETY: the bitmap is mapped and the list's run is over.
-        let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
+        // SAFETY: `missed_lease` keeps the bitmap mapped and exclusively ours
+        // until `HostList::reset`; the list's GPU run is over.
+        let marks = unsafe { std::slice::from_raw_parts(missed_lease.data() as *const u32, words) };
         marks.iter().enumerate().any(|(w, &mark)| {
             (0..32).filter(|b| mark >> b & 1 != 0).any(|b| {
                 let entry = w * 32 + b;
@@ -481,8 +598,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     list.defer_after(move || {
         let Layout { copies, blocks, owner, .. } = &*layout(key);
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the bitmap is mapped and the list's run is over.
-        let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
+        // SAFETY: `lease` keeps the bitmap mapped and exclusively ours until
+        // `HostList::reset`; the list's GPU run is over.
+        let marks = unsafe { std::slice::from_raw_parts_mut(lease.data() as *mut u32, words) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
@@ -895,5 +1013,80 @@ void main() {
         }
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+    }
+
+    /// Pooled bitmaps stay leased while a list is recording, executing, or
+    /// resubmitted, return only on `HostList::reset` (bounded by `cap`), and
+    /// are zeroed before reuse.
+    #[test]
+    fn bitmap_pool_reuses_zeroed_buffers_only_after_reset() {
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let pool = Arc::new(Mutex::new(BitmapPool::new(2)));
+        let list_a = host.new_list().unwrap();
+        let list_b = host.new_list().unwrap();
+        let list_c = host.new_list().unwrap();
+
+        // Bind A and submit a real GPU write marking a missing page so the GPU,
+        // `defer_missed`, and `defer_after` all read and clear the bitmap.
+        let (write_root, writer) = pipeline(WRITE);
+        let map_a = bind_from(&list_a, OURS, &pool).expect("bound A");
+        let missing: u64 = 0xff_f000_0000;
+        let constants = [0u32, 0, 0, missing as u32, (missing >> 32) as u32];
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list_a.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            list_a.list.SetComputeRootSignature(&write_root);
+            list_a.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+            list_a.list.SetComputeRootShaderResourceView(1, map_a.table);
+            list_a.list.SetComputeRootUnorderedAccessView(2, map_a.dirty);
+            list_a.list.SetComputeRoot32BitConstants(3, constants.len() as u32, constants.as_ptr().cast(), 0);
+            list_a.list.SetPipelineState(&writer);
+            list_a.list.Dispatch(1, 1, 1);
+        }
+        list_a.close();
+        assert_eq!(pool.lock().unwrap().free.len(), 0, "still leased while closed");
+
+        // Submit twice before reset: the bitmap must stay leased (not recycled
+        // while the closed list can still run and run its deferred closures).
+        host.execute(&[&list_a]);
+        assert_eq!(pool.lock().unwrap().free.len(), 0, "still leased after first run");
+        let map_b = bind_from(&list_b, OURS, &pool).expect("bound B");
+        assert_ne!(map_a.dirty, map_b.dirty, "concurrent list gets its own bitmap");
+        host.execute(&[&list_a]);
+        assert_eq!(pool.lock().unwrap().free.len(), 0, "still leased after second run");
+
+        // Resetting A returns its bitmap to the pool.
+        list_a.reset();
+        assert_eq!(pool.lock().unwrap().free.len(), 1, "returned on reset");
+
+        // Dirty words inside the idle pooled bitmap (simulating a list reset
+        // without running `defer_after`), then bind A again: same GPU address,
+        // completely zeroed.
+        let pooled_data = pool.lock().unwrap().free[0].data as *mut u32;
+        // SAFETY: idle mapped bitmap in our test-local pool.
+        unsafe {
+            pooled_data.write_volatile(0xdead_beef);
+            pooled_data.add(BITMAP_WORDS - 1).write_volatile(0xcafe_babe);
+        }
+        let map_a2 = bind_from(&list_a, OURS, &pool).expect("rebound A");
+        assert_eq!(map_a2.dirty, map_a.dirty, "reused the returned bitmap");
+        assert_eq!(pool.lock().unwrap().free.len(), 0);
+        // SAFETY: our mapped bitmap, freshly zeroed by `take_bitmap`.
+        let words = unsafe { std::slice::from_raw_parts(pooled_data, BITMAP_WORDS) };
+        assert!(words.iter().all(|&w| w == 0), "reused bitmap must be zeroed");
+
+        // Cap enforcement: 3 live leases returned to a pool of cap 2 keep 2.
+        let map_c = bind_from(&list_c, OURS, &pool).expect("bound C");
+        assert_ne!(map_c.dirty, map_a2.dirty);
+        assert_ne!(map_c.dirty, map_b.dirty);
+        list_a.close();
+        list_b.close();
+        list_c.close();
+        list_a.reset();
+        list_b.reset();
+        list_c.reset();
+        assert_eq!(pool.lock().unwrap().free.len(), 2, "pool stays bounded by cap");
     }
 }
