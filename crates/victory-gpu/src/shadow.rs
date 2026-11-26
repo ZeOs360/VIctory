@@ -411,11 +411,11 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
+        if let Some((taken, before)) = segments.iter_mut().find(|(at, bytes)| *at <= from && to <= *at + bytes.len())
             && back
             && from < to
         {
-            let before = &before[from - taken..to - taken];
+            let before = &mut before[from - *taken..to - *taken];
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
             // By 64 KiB piece: the copy compared with its bytes before the
@@ -429,11 +429,11 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before[at - from..at - from + n];
                 let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
-                // declared ranges overlap it: then what the GPU wrote there
-                // went back.
+                // declared ranges overlap it (the snapshot takes what went
+                // back, so comparing it again would find nothing).
                 if n == PIECE && !compared.insert(start + at) {
                     at += n;
                     continue;
@@ -448,6 +448,11 @@ impl Shadow {
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
                     }
+                    // So does the snapshot: a declared range overlapping
+                    // this one, copied back later, takes no title byte
+                    // read here for the GPU's, nor puts it back over a
+                    // later title write.
+                    old.copy_from_slice(title);
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
@@ -1474,6 +1479,53 @@ pub(crate) mod tests {
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
+    }
+
+    /// Two declared ranges of a copy overlap on a page; the title writes
+    /// a word there before the first copy-back and again before the
+    /// second. The first puts the GPU's bytes back and takes the title's;
+    /// the second, whichever of the two ranges comes first, must not take
+    /// the title's first word for the GPU's and put it back over the
+    /// second.
+    #[test]
+    fn overlapping_ranges_keep_a_title_write_made_between_their_copy_backs() {
+        let run = |whole_first: bool| {
+            let p = crate::watch::tests::pool(1);
+            register(p, p as u64, PAGE as u64);
+            let Some(copy) = find(p as u64, PAGE as u64) else {
+                unregister(p, p as u64);
+                return None;
+            };
+            copy.update(p, PAGE);
+            copy.writing(p, PAGE, false);
+            copy.writing(p + 16, 256, false);
+            // The GPU writes inside both ranges, and in the page only.
+            copy.write_host((p + 16) as u64, &[0xaa; 4]);
+            copy.write_host((p + 500) as u64, &[0xbb; 4]);
+            // SAFETY: our pool.
+            let put = |at: usize, v: u8| unsafe { (at as *mut [u8; 4]).write_volatile([v; 4]) };
+            // SAFETY: our pool.
+            let get = |at: usize| unsafe { (at as *const [u8; 4]).read_volatile() };
+            let ranges = [(p, PAGE), (p + 16, 256)];
+            let [first, second] = if whole_first { ranges } else { [ranges[1], ranges[0]] };
+            put(p + 200, 0x11);
+            copy.copy_back(first.0, first.1);
+            put(p + 200, 0x22);
+            copy.copy_back(second.0, second.1);
+            let got = [get(p + 16), get(p + 500), get(p + 200)];
+            unregister(p, p as u64);
+            Some(got)
+        };
+        let Some(whole_first) = run(true) else {
+            return; // no host GPU here
+        };
+        let part_first = run(false);
+        let want = Some([[0xaa; 4], [0xbb; 4], [0x22; 4]]);
+        assert_eq!(
+            [Some(whole_first), part_first],
+            [want, want],
+            "the GPU's bytes went back and the title's later write stayed, whole page first and part first"
+        );
     }
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
