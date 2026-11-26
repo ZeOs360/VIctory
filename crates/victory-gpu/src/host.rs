@@ -2557,26 +2557,39 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
+/// Copies `src` into title memory at `dst` in one kernel copy: false if a
+/// destination page is not writable (the bytes before it may be copied).
+pub(crate) fn write_once(dst: *mut u8, src: &[u8]) -> bool {
+    read(src.as_ptr(), dst, src.len())
+}
+
 /// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
+/// wrote), leaving pages that are not mapped alone. Returns the bytes
+/// copied.
 ///
 /// Through [`read`]: the kernel refuses an unmapped destination page as it
 /// does a source page. `WriteProcessMemory` makes the same copy, but asks
 /// for the destination's region first, at `VirtualQuery`'s cost (see
 /// [`copy_mapped`]): 0.35 ms for each piece of the world's copy-back, 39 ms
 /// per frame.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) -> usize {
     let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
     if len == 0 || write(dst as usize, len) {
-        return;
+        return len;
     }
+    let mut written = 0;
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+        if write(at, n) {
+            written += n;
+        } else {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                if write(at, n) {
+                    written += n;
+                }
             });
         }
     });
+    written
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of

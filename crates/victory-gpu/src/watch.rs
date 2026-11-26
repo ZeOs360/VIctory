@@ -532,6 +532,7 @@ impl Tracked {
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
+    #[cfg(test)]
     pub(crate) fn changed(&self, page: usize) -> bool {
         self.changed
             .0
@@ -542,10 +543,23 @@ impl Tracked {
 
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
+    /// Pages it does not track are left alone: never guarded (see
+    /// [`Tracked::untracked`] field).
     pub(crate) fn taken(&self, pages: &[usize]) {
+        let pages: Vec<usize> = pages
+            .iter()
+            .copied()
+            .filter(|&p| {
+                let (a, b) = ((p * PAGE).max(self.start), ((p + 1) * PAGE).min(self.end));
+                a < b && !self.untracked.iter().any(|&(x, y)| x < b && a < y)
+            })
+            .collect();
+        if pages.is_empty() {
+            return;
+        }
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        let others = aliases(&g, pages);
+        let others = aliases(&g, &pages);
         let unguarded = guard_aliases(&mut g, &others);
         let pages: Vec<usize> = pages
             .iter()

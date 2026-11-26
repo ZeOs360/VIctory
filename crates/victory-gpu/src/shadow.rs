@@ -24,45 +24,6 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
-fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
-    let mut changed = 0;
-    for ((title_byte, host_byte), old_byte) in title.iter_mut().zip(host).zip(old) {
-        let mask = 0u8.wrapping_sub(u8::from(*host_byte != *old_byte));
-        let delta = (*title_byte ^ *host_byte) & mask;
-        *title_byte ^= delta;
-        *host_byte = *title_byte;
-        changed |= delta;
-    }
-    changed != 0
-}
-
-#[test]
-fn writeback_merge_matches_bytewise_oracle() {
-    for len in [0, 1, 63, 64, 65, 193, 65_536] {
-        let old = vec![0x11; len];
-        for stride in [1, 5, 67, len + 1] {
-            let mut title = old.clone();
-            let mut host = old.clone();
-            for index in (0..len).step_by(3) {
-                title[index] = 0x22;
-            }
-            for index in (0..len).step_by(stride) {
-                host[index] = if index % 2 == 0 { 0x22 } else { 0x33 };
-            }
-            let expected: Vec<_> = host
-                .iter()
-                .zip(&old)
-                .zip(&title)
-                .map(|((&gpu, &previous), &cpu)| if gpu == previous { cpu } else { gpu })
-                .collect();
-            let changed = expected != title;
-            assert_eq!(merge_writeback(&mut title, &mut host, &old), changed);
-            assert_eq!(title, expected);
-            assert_eq!(host, expected);
-        }
-    }
-}
-
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -195,45 +156,15 @@ impl Shadow {
     /// the bytes of the page (cut to the copy) that differ from title memory
     /// go back into it, when the title has not written the page since the
     /// copy took it (then title memory is the copy as it was before the
-    /// submission, and what differs is what the GPU wrote). Returns the
-    /// bytes written; a page the title wrote meanwhile keeps the title's
-    /// bytes (logged once).
-    // shortcut: a page the copy holds only in part (at its ends) has no
-    // "copied" mark and is compared without the title-write check.
+    /// submission, and what differs is what the GPU wrote). Only those
+    /// bytes are written, as for a marked page ([`Shadow::copy_back_marked`],
+    /// whose steps these are): a title write landing meanwhile stays.
+    /// Returns the bytes written; a page the title wrote before the
+    /// copy-back asked keeps the title's bytes (logged once).
+    // shortcut: memory the copy does not track (not the runtime's) has no
+    // "changed" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (page.max(start), (page + PAGE).min(end));
-        if from >= to {
-            return 0;
-        }
-        if let Some(t) = &self.tracked
-            && t.changed(page / PAGE)
-        {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(
-                    page = format_args!("{page:#x}"),
-                    "the title and translated shaders both wrote a page of title memory in one submission: the title's bytes kept (logged once)"
-                )
-            });
-            return 0;
-        }
-        let n = to - from;
-        // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
-            return 0;
-        }
-        {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
-        }
-        // Our write is not the title's: the copy holds the page as it is.
-        if let Some(t) = &self.tracked {
-            t.taken(&[page / PAGE]);
-        }
-        n
+        self.copy_back_runs(page, false)
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -411,54 +342,78 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
+        if let Some((taken, before)) = segments.iter_mut().find(|(at, bytes)| *at <= from && to <= *at + bytes.len())
             && back
             && from < to
         {
-            let before = &before[from - taken..to - taken];
+            let before = &mut before[from - *taken..to - *taken];
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
+            // By 64 KiB piece (a page): the copy compared with its bytes
+            // before the submission, and only the runs that differ, the
+            // GPU's, written: the title's threads write the same memory
+            // meanwhile, and a write landing between a read of the piece and
+            // a write of all of it was put back to the older byte.
+            let mut scratch = Scratch::take(PAGE);
+            let Scratch { title, runs } = &mut scratch;
+            let mut whole = Vec::new();
             let mut at = from;
             while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
+                let n = (PAGE - (start + at) % PAGE).min(to - at);
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(at), n) };
+                let old = &mut before[at - from..at - from + n];
                 // A whole piece is compared once per submission, whichever
-                // declared ranges overlap it: then what the GPU wrote there
-                // went back.
-                if n == PIECE && !compared.insert(start + at) {
+                // declared ranges overlap it (the snapshot takes what went
+                // back, so comparing it again would find nothing).
+                if n == PAGE && !compared.insert(start + at) {
                     at += n;
                     continue;
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    if merge_writeback(title, host, old) {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                changed_runs(host, old, runs);
+                if !runs.is_empty() {
+                    #[cfg(test)]
+                    tests::marked_copy_back_at(tests::MarkedAt::Compared);
+                    written += put_back(start + at, host, runs);
+                    // So does the snapshot: a declared range overlapping
+                    // this one, copied back later, takes none of them for
+                    // the GPU's again (nor puts one back over a later title
+                    // write).
+                    for &[a, b] in runs.iter() {
+                        old[a..b].copy_from_slice(&host[a..b]);
                     }
-                    synced.push((start + at) / PAGE);
+                    if n == PAGE {
+                        whole.push(at);
+                    }
                 }
                 at += n;
             }
-            // Pages made equal to title memory are current in the copy, so
-            // our own write is not taken for the title's; others keep what
-            // they had (a title write there shows at the next refresh).
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if let Some(t) = &self.tracked {
-                let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
-                t.taken(&whole);
+            #[cfg(test)]
+            if !whole.is_empty() {
+                tests::marked_copy_back_at(tests::MarkedAt::Written);
+            }
+            // The copy takes the title's bytes of whole pages written back,
+            // as a marked page's: guarded first and read again after, so our
+            // own write is not taken for the title's, a title write before
+            // the guard is in what is read, and one after it marks the page
+            // changed again. Pieces less than a page stay changed
+            // (`put_back` marks them): the next refresh copies them.
+            if let Some(t) = &self.tracked
+                && !whole.is_empty()
+            {
+                t.taken(&whole.iter().map(|at| (start + at) / PAGE).collect::<Vec<_>>());
+                let title = &mut title[..PAGE];
+                for at in whole {
+                    if crate::host::read_into((start + at) as *const u8, title) {
+                        // SAFETY: inside the mapping, a whole page of it.
+                        unsafe { std::slice::from_raw_parts_mut(self.data.add(at), PAGE) }.copy_from_slice(title);
+                        let old = &mut before[at - from..at - from + PAGE];
+                        old.copy_from_slice(title);
+                    }
+                }
             }
         }
         // Every submitted step that declared the range is done with it (one
@@ -496,9 +451,17 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
-        let Some(t) = &self.tracked else {
+        if self.tracked.is_none() {
             return 0;
-        };
+        }
+        self.copy_back_runs(page, true)
+    }
+
+    /// [`Shadow::copy_back_marked`]'s steps, for a marked page or (not
+    /// `marked`) one shaders wrote at computed addresses
+    /// ([`Shadow::copy_back_page`]: not armed, and in a copy that may not be
+    /// tracked, whose read then tells what the GPU changed).
+    fn copy_back_runs(&self, page: usize, marked: bool) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
@@ -514,18 +477,28 @@ impl Shadow {
         #[cfg(test)]
         tests::marked_copy_back_at(tests::MarkedAt::Read);
         // Our own write below must not save the page for this copy again.
-        let finished = t.finish(page / PAGE);
+        let finished = self.tracked.as_ref().map(|t| t.finish(page / PAGE));
         #[cfg(test)]
         tests::marked_copy_back_at(tests::MarkedAt::Finished);
         if !read {
             return 0;
         }
         let saved = match finished {
-            crate::watch::Finished::Untouched => None,
-            crate::watch::Finished::Saved(bytes) => Some(bytes),
-            crate::watch::Finished::Unsaved => {
+            None | Some(crate::watch::Finished::Untouched) => None,
+            Some(crate::watch::Finished::Saved(bytes)) => Some(bytes),
+            Some(crate::watch::Finished::Unsaved) if marked => {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::MarkedKept, 1);
+                return 0;
+            }
+            Some(crate::watch::Finished::Unsaved) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        page = format_args!("{page:#x}"),
+                        "the title and translated shaders both wrote a page of title memory in one submission: the title's bytes kept (logged once)"
+                    )
+                });
                 return 0;
             }
         };
@@ -540,40 +513,34 @@ impl Shadow {
             // Untouched and unchanged: still guarded, and equal to the copy.
             return 0;
         }
-        if !runs.is_empty() {
-            #[cfg(feature = "diagnostics")]
+        #[cfg(feature = "diagnostics")]
+        if marked && !runs.is_empty() {
             crate::copystat::add(crate::copystat::C::MarkedRuns, runs.len() as u64);
-            let _writing = crate::watch::writing(from, n);
-            // SAFETY: the runs lie in `host`, ours; the destination is the
-            // title's page, which `store_runs` stops at if it went.
-            let at = unsafe { crate::watch::store_runs(from as *mut u8, host.as_ptr(), runs) };
-            // Where a store failed (the page went, or is read-only not by
-            // our guards), that run and the rest go through the kernel, as
-            // far as mapped.
-            for &[a, b] in &runs[at..] {
-                crate::host::write_mapped((from + a) as *mut u8, host[a..].as_ptr(), b - a);
-            }
         }
-        let written = runs.iter().map(|[a, b]| b - a).sum();
-        // The copy takes the title's bytes, the shaders' among them. A copy
-        // holding the whole page takes it: guarded first and read again
-        // after, so a title write before the guard is in what is read, and
-        // one after it marks the page changed again (the shaders' bytes are
-        // in the title's then, and need no merging).
-        if from == page && to == page + PAGE {
+        let written = put_back(from, host, runs);
+        #[cfg(test)]
+        tests::marked_copy_back_at(tests::MarkedAt::Written);
+        // The copy takes the title's bytes, the shaders' among them: its part
+        // of the page is taken, guarded first and read again after, so a
+        // title write before the guard is in what is read, and one after it
+        // marks the page changed again (the shaders' bytes are in the
+        // title's then, and need no merging).
+        if let Some(t) = &self.tracked {
             t.taken(&[page / PAGE]);
             if crate::host::read_into(from as *const u8, title) {
                 host.copy_from_slice(title);
                 return written;
             }
         }
-        // One holding it in part leaves it changed (the next update copies
-        // it), and where the page cannot be read again: the bytes read, with
-        // the shaders' merged.
-        for &[a, b] in runs.iter() {
-            title[a..b].copy_from_slice(&host[a..b]);
+        // Where the page cannot be read again, or the copy is not tracked:
+        // the bytes read, with the shaders' merged (with nothing saved they
+        // are the copy's already).
+        if saved.is_some() {
+            for &[a, b] in runs.iter() {
+                title[a..b].copy_from_slice(&host[a..b]);
+            }
+            host.copy_from_slice(title);
         }
-        host.copy_from_slice(title);
         written
     }
 
@@ -937,6 +904,49 @@ thread_local! {
     /// [`Scratch`]'s buffers, kept between pages.
     static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<[usize; 2]>)> =
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Writes the runs `[a, b]` (bytes `a..b`) of `host` into title memory at
+/// `at` (`host`'s first byte), and returns the bytes written. With plain
+/// stores ([`crate::watch::store_runs`]); where one fails (the page went, or
+/// is read-only not by our guards), that run goes through the kernel, as
+/// far as mapped, and the stores go on after it, past the runs on a 4 KiB
+/// page found not writable (a page of thousands of runs with nothing mapped
+/// cost as many failing kernel copies). The pages written count as changed
+/// in every copy of them ([`crate::watch::writing`]).
+fn put_back(at: usize, host: &[u8], runs: &[[usize; 2]]) -> usize {
+    const SMALL: usize = 4 << 10;
+    if runs.is_empty() {
+        return 0;
+    }
+    let _writing = crate::watch::writing(at, host.len());
+    let (mut written, mut i) = (0, 0);
+    while i < runs.len() {
+        // SAFETY: the runs lie in `host`, ours; the destination is title
+        // memory, which `store_runs` stops at if it went.
+        let done = i + unsafe { crate::watch::store_runs(at as *mut u8, host.as_ptr(), &runs[i..]) };
+        written += runs[i..done].iter().map(|[a, b]| b - a).sum::<usize>();
+        let Some(&[a, b]) = runs.get(done) else {
+            break;
+        };
+        let (first, last) = ((at + a) / SMALL, (at + b - 1) / SMALL);
+        let failed = if first != last {
+            // Across 4 KiB pages: piece by piece.
+            written += crate::host::write_mapped((at + a) as *mut u8, host[a..].as_ptr(), b - a);
+            None
+        } else if crate::host::write_once((at + a) as *mut u8, &host[a..b]) {
+            written += b - a;
+            None
+        } else {
+            Some(first)
+        };
+        i = done + 1;
+        // Runs wholly on that page are left.
+        while i < runs.len() && Some((at + runs[i][0]) / SMALL) == failed && Some((at + runs[i][1] - 1) / SMALL) == failed {
+            i += 1;
+        }
+    }
+    written
 }
 
 /// A page's worth of bytes and a list of runs for a copy-back on this
@@ -1558,6 +1568,18 @@ pub(crate) mod tests {
         assert_eq!(copy.read_host(word as u64, 1), [0x5678], "the title's change reaches the copy");
         assert_eq!(protection(pool), PAGE_READONLY, "the pool is guarded");
         assert_eq!(protection(plain), PAGE_READWRITE, "the plain allocation is not");
+        // What the GPU writes there goes back, and the page stays unguarded
+        // (a guard there could stop a thread holding the heap's lock, which
+        // the write handler may need).
+        copy.writing(pool, len, false);
+        copy.write_host((plain + 128) as u64, &[0xab; 4]);
+        copy.copy_back(pool, len);
+        copy.write_host((plain + 256) as u64, &[0xcd; 4]);
+        copy.copy_back_page(plain);
+        // SAFETY: words of our plain allocation.
+        let back = unsafe { [((plain + 128) as *const u32).read_volatile(), ((plain + 256) as *const u32).read_volatile()] };
+        assert_eq!(back, [0xabab_abab, 0xcdcd_cdcd], "the GPU's words went back");
+        assert_eq!(protection(plain), PAGE_READWRITE, "and the plain allocation is still not guarded");
         unregister(pool, pool as u64);
         // The pages stay allocated (as the other tests' pools): a copy some
         // page table still holds must not name memory reused meanwhile.
@@ -1615,8 +1637,8 @@ pub(crate) mod tests {
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
-        assert_eq!(copy.copy_back(p + 16, 64), 64, "the range's part of the piece");
-        assert_eq!(copy.copy_back(p + PAGE, 2 * PAGE), PAGE, "the piece written");
+        assert_eq!(copy.copy_back(p + 16, 64), 3, "the GPU's bytes in the range");
+        assert_eq!(copy.copy_back(p + PAGE, 2 * PAGE), 1, "and in the piece");
         assert_eq!(copy.copy_back(p + PAGE, PAGE), 0, "compared once");
         assert_eq!(copy.copy_back(p + 3 * PAGE, 100), 0);
         assert_eq!(copy.copy_back(p + 80, 8), 0);
@@ -1625,6 +1647,59 @@ pub(crate) mod tests {
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
+    }
+
+    /// Two declared ranges of a copy overlap on a page; the title writes
+    /// a word there before the first copy-back and again before the
+    /// second, and between them over a word the GPU wrote in both ranges.
+    /// The second copy-back, whichever of the two ranges comes first, must
+    /// not take the title's first word (which a whole page's copy-back took
+    /// into the copy) for the GPU's, nor the GPU's word the first put back,
+    /// and put either back over the title's later writes.
+    #[test]
+    fn overlapping_ranges_keep_a_title_write_made_between_their_copy_backs() {
+        // A submission meanwhile (another test's) would refresh this copy:
+        // none runs while this is held.
+        let _one = host().map(|h| h.no_submissions());
+        let run = |whole_first: bool| {
+            let p = crate::watch::tests::pool(1);
+            register(p, p as u64, PAGE as u64);
+            let Some(copy) = find(p as u64, PAGE as u64) else {
+                unregister(p, p as u64);
+                return None;
+            };
+            copy.update(p, PAGE);
+            copy.writing(p, PAGE, false);
+            copy.writing(p + 16, 256, false);
+            // The GPU writes inside both ranges, and in the page only.
+            copy.write_host((p + 16) as u64, &[0xaa; 4]);
+            copy.write_host((p + 24) as u64, &[0xcc; 4]);
+            copy.write_host((p + 500) as u64, &[0xbb; 4]);
+            // SAFETY: our pool.
+            let put = |at: usize, v: u8| unsafe { (at as *mut [u8; 4]).write_volatile([v; 4]) };
+            // SAFETY: our pool.
+            let get = |at: usize| unsafe { (at as *const [u8; 4]).read_volatile() };
+            let ranges = [(p, PAGE), (p + 16, 256)];
+            let [first, second] = if whole_first { ranges } else { [ranges[1], ranges[0]] };
+            put(p + 200, 0x11);
+            copy.copy_back(first.0, first.1);
+            put(p + 200, 0x22);
+            put(p + 24, 0x33);
+            copy.copy_back(second.0, second.1);
+            let got = [get(p + 16), get(p + 500), get(p + 200), get(p + 24)];
+            unregister(p, p as u64);
+            Some(got)
+        };
+        let Some(whole_first) = run(true) else {
+            return; // no host GPU here
+        };
+        let part_first = run(false);
+        let want = Some([[0xaa; 4], [0xbb; 4], [0x22; 4], [0x33; 4]]);
+        assert_eq!(
+            [Some(whole_first), part_first],
+            [want, want],
+            "the GPU's bytes went back and the title's later write stayed, whole page first and part first"
+        );
     }
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
@@ -1821,14 +1896,21 @@ pub(crate) mod tests {
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
     }
 
-    /// Points inside [`Shadow::copy_back_marked`] where a test runs a title
-    /// write, on this thread.
+    /// Points inside a copy-back ([`Shadow::copy_back_marked`],
+    /// [`Shadow::copy_back_page`], [`Shadow::copy_back`]) where a test runs a
+    /// title write, on this thread.
     #[derive(Clone, Copy, PartialEq)]
     pub(super) enum MarkedAt {
-        /// The page was read, still armed: the write saves its bytes first.
+        /// The page was read (a marked one still armed: the write saves its
+        /// bytes first).
         Read,
         /// The copy-back asked what the title did: the write is after that.
         Finished,
+        /// A declared range's copy-back ([`Shadow::copy_back`]) found runs
+        /// of a piece that go back, not written yet.
+        Compared,
+        /// The runs went back; the copy has not taken the page yet.
+        Written,
     }
 
     /// A title write a test runs inside the copy-back.
@@ -1965,5 +2047,122 @@ pub(crate) mod tests {
             assert_eq!(title_bytes, [0x11, 0x22, 0x33, 0x44], "{at}: the title's write stays");
             assert_eq!(host, [0x4433_2211], "{at}: the copy takes the title's bytes");
         }
+    }
+
+    /// A title write made while a page's copy-back runs, outside the GPU's
+    /// bytes, at `at` in it: a declared range's ([`Shadow::copy_back`]) or,
+    /// with `page`, one written at computed addresses
+    /// ([`Shadow::copy_back_page`]). The GPU wrote 4 bytes at 16; the title
+    /// writes 4 at 200, which held -1. Returns the bytes written, the GPU's
+    /// and the title's bytes in title memory, and the copy's at 200 after
+    /// its next refresh (`None`: no host GPU here).
+    fn title_write_inside(at: MarkedAt, page: bool) -> Option<(usize, [u8; 4], [u8; 4], u32)> {
+        let p = crate::watch::tests::pool(1);
+        let title = move |at: usize| (p + at) as *mut u8;
+        // SAFETY: (title writes and reads below) bytes of our pool.
+        unsafe { (title(200) as *mut [u8; 4]).write_volatile([0xff; 4]) };
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return None;
+        };
+        copy.update(p, PAGE);
+        if !page {
+            copy.writing(p, PAGE, false);
+        }
+        copy.write_host((p + 16) as u64, &[0xaa, 0xbb, 0xcc, 0xdd]);
+        let write = move || {
+            // SAFETY: our pool (if guarded, the handler opens the page).
+            unsafe { (title(200) as *mut [u8; 4]).write_volatile([0x11, 0x22, 0x33, 0x44]) };
+        };
+        MARKED_HOOK.with(|h| *h.borrow_mut() = Some((at, Box::new(write))));
+        let written = if page { copy.copy_back_page(p) } else { copy.copy_back(p, PAGE) };
+        let hook_ran = MARKED_HOOK.with(|h| h.borrow_mut().take()).is_none();
+        // SAFETY: as above.
+        let read = |at: usize| unsafe { (title(at) as *const [u8; 4]).read_volatile() };
+        let (gpu, title_bytes) = (read(16), read(200));
+        copy.update(p, PAGE);
+        let host = copy.read_host((p + 200) as u64, 1)[0];
+        unregister(p, p as u64);
+        assert!(hook_ran, "the title write ran inside the copy-back");
+        Some((written, gpu, title_bytes, host))
+    }
+
+    /// A title write to a declared range's page while its copy-back runs
+    /// stays, and the copy takes it: only the runs the GPU changed go back,
+    /// whether the write landed before them or after them and before the
+    /// copy took the page. Reading the piece and writing all of it put the
+    /// older byte back over a write between the two, and taking the page
+    /// unguarded left the copy without one after (and not changed).
+    #[test]
+    fn copy_back_keeps_a_title_write_made_meanwhile() {
+        // A submission meanwhile (another test's) would refresh this copy:
+        // none runs while this is held.
+        let _one = host().map(|h| h.no_submissions());
+        for at in [MarkedAt::Compared, MarkedAt::Written] {
+            let Some(got) = title_write_inside(at, false) else {
+                return; // no host GPU here
+            };
+            let at = if at == MarkedAt::Compared { "before the runs went" } else { "after them" };
+            assert_eq!(
+                got,
+                (4, [0xaa, 0xbb, 0xcc, 0xdd], [0x11, 0x22, 0x33, 0x44], 0x4433_2211),
+                "{at}: the GPU's bytes alone written, the title's stay, the copy holds them"
+            );
+        }
+    }
+
+    /// The same for a page shaders wrote at computed addresses (not
+    /// armed). A title write before the copy-back asked is the title's
+    /// page (its bytes kept, the GPU's there lost, as before); one after it,
+    /// or after the runs went, stays with the GPU's bytes. Writing the whole
+    /// page put the older byte back over a write landing after the
+    /// "changed" check.
+    #[test]
+    fn copy_back_page_keeps_a_title_write_made_meanwhile() {
+        let _one = host().map(|h| h.no_submissions());
+        for at in [MarkedAt::Read, MarkedAt::Finished, MarkedAt::Written] {
+            let Some(got) = title_write_inside(at, true) else {
+                return; // no host GPU here
+            };
+            let (name, want) = match at {
+                MarkedAt::Read => ("before it asked", (0, [0; 4], [0x11, 0x22, 0x33, 0x44], 0x4433_2211)),
+                MarkedAt::Finished => ("after it asked", (4, [0xaa, 0xbb, 0xcc, 0xdd], [0x11, 0x22, 0x33, 0x44], 0x4433_2211)),
+                _ => ("after the runs went", (4, [0xaa, 0xbb, 0xcc, 0xdd], [0x11, 0x22, 0x33, 0x44], 0x4433_2211)),
+            };
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    /// Runs going back to a page partly not writable: those on its 4 KiB
+    /// pages that are go back, with plain stores after the first that
+    /// failed; those on the others are not tried one by one, nor counted.
+    #[test]
+    fn put_back_skips_a_4k_page_it_cannot_write() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: a 4 KiB page of our pool.
+        assert_ne!(unsafe { VirtualFree((p + 8192) as *mut _, 4096, MEM_DECOMMIT) }, 0);
+        let host: Vec<u8> = (0..PAGE).map(|i| (i % 251) as u8 + 1).collect();
+        // Every other byte, one run across into the decommitted page and
+        // one across out of it.
+        let mut runs: Vec<[usize; 2]> = (0..PAGE / 2).map(|k| [2 * k, 2 * k + 1]).collect();
+        runs.retain(|&[a, _]| !(8180..8200).contains(&a) && !(12280..12300).contains(&a));
+        runs.extend([[8180, 8200], [12280, 12300]]);
+        runs.sort_unstable();
+        let written = super::put_back(p, &host, &runs);
+        let writable = runs
+            .iter()
+            .map(|&[a, b]| (b - a) - (b.min(12288).saturating_sub(a.max(8192))))
+            .sum::<usize>();
+        let mut want = vec![0u8; PAGE];
+        for &[a, b] in &runs {
+            want[a..b].copy_from_slice(&host[a..b]);
+        }
+        // SAFETY: committed pages of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        let ok = (0..PAGE).filter(|i| !(8192..12288).contains(i)).all(|i| read(i) == want[i]);
+        assert!(ok, "the runs on writable pages went back, nothing else");
+        assert_eq!(written, writable, "the bytes written, those on the decommitted page left out");
     }
 }
