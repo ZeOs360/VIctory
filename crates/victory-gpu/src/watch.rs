@@ -884,6 +884,38 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     }
 }
 
+/// For each title page address in `pages`, the lowest page address among it
+/// and the pages showing the same physical memory elsewhere
+/// ([`title_memory_aliased`]): one key for every mapping of a page, under
+/// one lock.
+pub(crate) fn alias_roots(pages: &[usize]) -> Vec<usize> {
+    let g = guards();
+    let mut seen = Vec::new();
+    pages
+        .iter()
+        .map(|&at| {
+            let page = at / PAGE;
+            if !g.alias_of.contains_key(&page) {
+                return page * PAGE;
+            }
+            // Links are made both ways to every mapping there was, but a
+            // walk costs little and does not lean on that.
+            seen.clear();
+            seen.push(page);
+            let mut i = 0;
+            while let Some(&p) = seen.get(i) {
+                for &o in g.alias_of.get(&p).into_iter().flatten() {
+                    if !seen.contains(&o) {
+                        seen.push(o);
+                    }
+                }
+                i += 1;
+            }
+            seen.iter().min().copied().unwrap_or(page) * PAGE
+        })
+        .collect()
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {

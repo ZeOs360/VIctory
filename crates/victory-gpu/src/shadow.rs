@@ -897,9 +897,11 @@ const PAGES_PER_THREAD: usize = 8;
 /// Runs `f` on every `(copy, page)`, on several threads when there are many:
 /// a 64 KiB page costs 55 to 80 microseconds (two reads, a compare, writes
 /// and a protection change), and a world frame marks 2,000. The copies of
-/// one page keep their order, on one thread.
-fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow>, usize) + Sync) {
-    pages.sort_by_key(|&(_, page)| page);
+/// one page keep their order, on one thread, and so do the pages showing
+/// the same physical memory elsewhere ([`crate::watch::alias_roots`]): the
+/// first one's write saves the other's bytes for the second ([`crate::
+/// watch::writing`]), which two threads at once would race.
+fn for_each_by_page(pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow>, usize) + Sync) {
     let threads = (pages.len() / PAGES_PER_THREAD).min(PAGE_THREADS);
     if threads < 2 {
         for (copy, page) in &pages {
@@ -907,11 +909,16 @@ fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow
         }
         return;
     }
-    let groups: Vec<&[(Arc<Shadow>, usize)]> = pages.chunk_by(|a, b| a.1 == b.1).collect();
+    let roots = crate::watch::alias_roots(&pages.iter().map(|&(_, page)| page).collect::<Vec<_>>());
+    let mut pages: Vec<(usize, Arc<Shadow>, usize)> =
+        roots.into_iter().zip(pages).map(|(root, (copy, page))| (root, copy, page)).collect();
+    // Stable: in mark order within a group.
+    pages.sort_by_key(|&(root, ..)| root);
+    let groups: Vec<&[(usize, Arc<Shadow>, usize)]> = pages.chunk_by(|a, b| a.0 == b.0).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let work = || {
         while let Some(group) = groups.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-            for (copy, page) in *group {
+            for (_, copy, page) in *group {
                 f(copy, *page);
             }
         }
@@ -1727,6 +1734,41 @@ pub(crate) mod tests {
         inner.copy_back(p + len / 2, len / 2);
         unregister(p + 1, (p + len / 2) as u64);
         unregister(p, p as u64);
+    }
+
+    /// Two mappings of the same physical pages: each page's two copies go
+    /// back on one thread, in mark order (the higher mapping first here, as
+    /// sorting by address would not keep), with enough pages for threads.
+    #[test]
+    fn aliased_pages_go_back_on_one_thread_in_mark_order() {
+        const PAGES: usize = 16;
+        let (a, b) = crate::watch::tests::twin_views(PAGES);
+        let (hi, lo) = (a.max(b), a.min(b));
+        let len = PAGES * PAGE;
+        register(hi, hi as u64, len as u64);
+        register(lo, lo as u64, len as u64);
+        let (Some(high), Some(low)) = (find(hi as u64, len as u64), find(lo as u64, len as u64)) else {
+            unregister(lo, lo as u64);
+            unregister(hi, hi as u64);
+            return; // no host GPU here
+        };
+        let pages: Vec<(Arc<Shadow>, usize)> = (0..PAGES)
+            .flat_map(|k| [(high.clone(), hi + k * PAGE), (low.clone(), lo + k * PAGE)])
+            .collect();
+        let calls = Mutex::new(Vec::new());
+        for_each_by_page(pages, |_, page| {
+            calls.lock().unwrap().push((std::thread::current().id(), page));
+        });
+        let calls = calls.into_inner().unwrap();
+        assert_eq!(calls.len(), 2 * PAGES);
+        let at = |page: usize| calls.iter().position(|&(_, p)| p == page).expect("went back");
+        for k in 0..PAGES {
+            let (first, second) = (at(hi + k * PAGE), at(lo + k * PAGE));
+            assert!(first < second, "page {k}: mark order kept");
+            assert_eq!(calls[first].0, calls[second].0, "page {k}: one thread");
+        }
+        unregister(lo, lo as u64);
+        unregister(hi, hi as u64);
     }
 
     /// Mark bits are handed out in runs and come back joined.
