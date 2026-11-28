@@ -44,13 +44,17 @@ fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
 /// # Safety
 /// `src..src + n` readable, `dst..dst + n` writable, not overlapping.
 unsafe fn read_combined(src: *const u8, dst: *mut u8, n: usize) {
+    if n == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("sse4.1") {
         // SAFETY: the caller's ranges; SSE4.1 is there.
-        unsafe { stream_copy(src, dst, n) }
-    } else {
-        // SAFETY: the caller's ranges.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, n) }
+        unsafe { stream_copy(src, dst, n) };
+        return;
     }
+    // SAFETY: the caller's ranges.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, n) }
 }
 
 /// [`read_combined`] with `MOVNTDQA`, 64 bytes at a time from 16-byte
@@ -58,6 +62,7 @@ unsafe fn read_combined(src: *const u8, dst: *mut u8, n: usize) {
 ///
 /// # Safety
 /// As [`read_combined`]; the CPU has SSE4.1.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 unsafe fn stream_copy(src: *const u8, dst: *mut u8, n: usize) {
     use std::arch::x86_64::{__m128i, _mm_mfence, _mm_storeu_si128, _mm_stream_load_si128};
@@ -315,7 +320,8 @@ impl Shadow {
     /// itself was changed in place otherwise).
     ///
     /// # Safety
-    /// `[at, at + bytes.len())` inside the mapping.
+    /// `[at, at + bytes.len())` inside the mapping; `bytes` not in it (the
+    /// buffer [`Shadow::work_bytes`] filled).
     unsafe fn keep(&self, at: usize, bytes: &[u8]) {
         if self.wc.load(std::sync::atomic::Ordering::Relaxed) {
             // SAFETY: the caller's; `bytes` is our buffer, not the mapping.
@@ -1894,6 +1900,18 @@ pub(crate) mod tests {
     /// back to the pre-fault value.
     #[test]
     fn partial_refresh_under_marked_range_updates_saved_bytes() {
+        partial_refresh_under_marked_range(false);
+    }
+
+    /// The same through a copy read as write-combined video memory: the
+    /// copy-backs work on bytes read out of it and write back what they
+    /// change ([`Shadow::work_bytes`], [`Shadow::keep`]).
+    #[test]
+    fn partial_refresh_under_marked_range_through_a_write_combined_copy() {
+        partial_refresh_under_marked_range(true);
+    }
+
+    fn partial_refresh_under_marked_range(wc: bool) {
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -1901,6 +1919,9 @@ pub(crate) mod tests {
             unregister(p, p as u64);
             return; // no host GPU here
         };
+        if wc {
+            copy.write_combined();
+        }
         let write = |at: usize, v: u8| {
             // SAFETY: a byte of our pool.
             unsafe { ((p + at) as *mut u8).write_volatile(v) };
