@@ -36,6 +36,81 @@ fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
     changed != 0
 }
 
+/// Copies `n` bytes from `src`, video memory the CPU maps write-combined
+/// ([`Shadow::write_combined`]), to `dst`, with streaming loads: plain loads
+/// read such memory a load at a time over the bus, streaming ones a line at a
+/// time (copy-backs comparing it went from 22-28 MB/s to 467-800 MB/s).
+///
+/// # Safety
+/// `src..src + n` readable, `dst..dst + n` writable, not overlapping.
+unsafe fn read_combined(src: *const u8, dst: *mut u8, n: usize) {
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        // SAFETY: the caller's ranges; SSE4.1 is there.
+        unsafe { stream_copy(src, dst, n) }
+    } else {
+        // SAFETY: the caller's ranges.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, n) }
+    }
+}
+
+/// [`read_combined`] with `MOVNTDQA`, 64 bytes at a time from 16-byte
+/// aligned source addresses, the unaligned head and tail plainly.
+///
+/// # Safety
+/// As [`read_combined`]; the CPU has SSE4.1.
+#[target_feature(enable = "sse4.1")]
+unsafe fn stream_copy(src: *const u8, dst: *mut u8, n: usize) {
+    use std::arch::x86_64::{__m128i, _mm_mfence, _mm_storeu_si128, _mm_stream_load_si128};
+    // Our own write-combined stores to the copy (its refresh) are seen first.
+    _mm_mfence();
+    let head = src.align_offset(16).min(n);
+    // SAFETY: the first `head <= n` bytes of the caller's ranges.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, head) };
+    let mut i = head;
+    while i + 64 <= n {
+        // SAFETY: bytes `i..i + 64` of the caller's ranges; `src + i` is
+        // 16-byte aligned past the head, as streaming loads need.
+        unsafe {
+            let s = src.add(i).cast::<__m128i>();
+            let d = dst.add(i).cast::<__m128i>();
+            let (a, b, c, e) = (
+                _mm_stream_load_si128(s),
+                _mm_stream_load_si128(s.add(1)),
+                _mm_stream_load_si128(s.add(2)),
+                _mm_stream_load_si128(s.add(3)),
+            );
+            _mm_storeu_si128(d, a);
+            _mm_storeu_si128(d.add(1), b);
+            _mm_storeu_si128(d.add(2), c);
+            _mm_storeu_si128(d.add(3), e);
+        }
+        i += 64;
+    }
+    while i + 16 <= n {
+        // SAFETY: bytes `i..i + 16` of the caller's ranges, `src + i` aligned.
+        unsafe { _mm_storeu_si128(dst.add(i).cast(), _mm_stream_load_si128(src.add(i).cast())) };
+        i += 16;
+    }
+    // SAFETY: the last `n - i < 16` bytes of the caller's ranges.
+    unsafe { std::ptr::copy_nonoverlapping(src.add(i), dst.add(i), n - i) };
+}
+
+/// A write-combined copy's bytes read with streaming loads are its bytes:
+/// from every alignment, in lengths around the 16- and 64-byte steps.
+#[test]
+fn write_combined_reads_copy_every_byte() {
+    let src: Vec<u8> = (0..1024u32).map(|i| (i * 7 + 3) as u8).collect();
+    for offset in 0..32 {
+        for n in [0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 200, 640] {
+            let mut dst = vec![0xAAu8; n + 2];
+            // SAFETY: both inside their vectors; SSE4.1 checked inside.
+            unsafe { read_combined(src.as_ptr().add(offset), dst.as_mut_ptr().add(1), n) };
+            assert_eq!(&dst[1..=n], &src[offset..offset + n], "offset {offset}, {n} bytes");
+            assert_eq!((dst[0], dst[n + 1]), (0xAA, 0xAA), "offset {offset}, {n} bytes: outside");
+        }
+    }
+}
+
 #[test]
 fn writeback_merge_matches_bytewise_oracle() {
     for len in [0, 1, 63, 64, 65, 193, 65_536] {
@@ -210,6 +285,66 @@ impl Shadow {
         }
     }
 
+    /// Bytes `[at, at + n)` of the copy to work on, on the CPU: the mapping
+    /// itself, or for a write-combined copy `out`, filled with streaming
+    /// loads ([`read_combined`]); [`Shadow::keep`] then puts changes back.
+    ///
+    /// # Safety
+    /// `[at, at + n)` inside the mapping, which nothing else touches while
+    /// the bytes are used.
+    unsafe fn work_bytes<'a>(&'a self, at: usize, n: usize, out: &'a mut Vec<u8>) -> &'a mut [u8] {
+        // SAFETY: inside the mapping (the caller's).
+        let src = unsafe { self.data.add(at) };
+        if self.wc.load(std::sync::atomic::Ordering::Relaxed) {
+            out.clear();
+            out.reserve(n);
+            // SAFETY: `out` has room for `n` bytes, which the copy fills.
+            unsafe {
+                read_combined(src, out.as_mut_ptr(), n);
+                out.set_len(n);
+            }
+            out
+        } else {
+            // SAFETY: the caller's.
+            unsafe { std::slice::from_raw_parts_mut(src, n) }
+        }
+    }
+
+    /// After [`Shadow::work_bytes`] changed `bytes` (of `[at, at + len)`): a
+    /// write-combined copy takes them (writing it is fast; the mapping
+    /// itself was changed in place otherwise).
+    ///
+    /// # Safety
+    /// `[at, at + bytes.len())` inside the mapping.
+    unsafe fn keep(&self, at: usize, bytes: &[u8]) {
+        if self.wc.load(std::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: the caller's; `bytes` is our buffer, not the mapping.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+        }
+    }
+
+    /// Appends bytes `[a, b)` of the copy to `to` (with streaming loads for a
+    /// write-combined copy).
+    ///
+    /// # Safety
+    /// `[a, b)` inside the mapping.
+    unsafe fn append_bytes(&self, to: &mut Vec<u8>, a: usize, b: usize) {
+        let n = b - a;
+        if self.wc.load(std::sync::atomic::Ordering::Relaxed) {
+            to.reserve(n);
+            let len = to.len();
+            // SAFETY: inside the mapping (the caller's); `to` has room for `n`
+            // more bytes, which the copy fills.
+            unsafe {
+                read_combined(self.data.add(a), to.as_mut_ptr().add(len), n);
+                to.set_len(len + n);
+            }
+        } else {
+            // SAFETY: the caller's.
+            to.extend_from_slice(unsafe { std::slice::from_raw_parts(self.data.add(a), n) });
+        }
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.base
@@ -250,8 +385,9 @@ impl Shadow {
             return 0;
         }
         let n = to - from;
+        let mut out = Vec::new();
         // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
+        let host: &[u8] = unsafe { self.work_bytes(from - start, n, &mut out) };
         let mut title = vec![0u8; n];
         if !crate::host::read_into(from as *const u8, &mut title) || title == host {
             return 0;
@@ -370,7 +506,7 @@ impl Shadow {
         }
         self.wc_read();
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host = |to: &mut Vec<u8>, a: usize, b: usize| unsafe { self.append_bytes(to, a, b) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let segments = &mut before.0;
         // The segments the range overlaps or touches.
@@ -394,12 +530,12 @@ impl Shadow {
         let mut grown = pooled(end - start);
         let mut at = start;
         for (taken, bytes) in segments.drain(first..last) {
-            grown.extend_from_slice(host(at, taken));
+            host(&mut grown, at, taken);
             grown.extend_from_slice(&bytes);
             at = taken + bytes.len();
             give_back(bytes);
         }
-        grown.extend_from_slice(host(at, end));
+        host(&mut grown, at, end);
         segments.insert(first, (start, grown));
     }
 
@@ -456,15 +592,11 @@ impl Shadow {
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
+            let mut out = Vec::new();
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
                 // went back.
@@ -472,6 +604,11 @@ impl Shadow {
                     at += n;
                     continue;
                 }
+                // SAFETY: inside the mapping; only the submitting thread
+                // writes it.
+                let host = unsafe { self.work_bytes(at, n, &mut out) };
+                let old = &before[at - from..at - from + n];
+                let title = &mut title[..n];
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
@@ -482,6 +619,8 @@ impl Shadow {
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
                     }
+                    // SAFETY: inside the mapping (the piece's bytes).
+                    unsafe { self.keep(at, host) };
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
@@ -540,8 +679,10 @@ impl Shadow {
             return 0;
         }
         let n = to - from;
+        self.wc_read();
+        let mut out = Vec::new();
         // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
+        let host = unsafe { self.work_bytes(from - start, n, &mut out) };
         let mut title = vec![0u8; n];
         if !crate::host::read_into(from as *const u8, &mut title) {
             return 0;
@@ -552,7 +693,10 @@ impl Shadow {
             None => (*host != title[..]).then_some(host.as_ptr()),
             Some(before) => {
                 let before = &before[from - page..to - page];
-                merge_writeback(&mut title, host, before).then_some(title.as_ptr())
+                let merged = merge_writeback(&mut title, host, before);
+                // SAFETY: inside the mapping (the page's bytes).
+                unsafe { self.keep(from - start, host) };
+                merged.then_some(title.as_ptr())
             }
         };
         if let Some(bytes) = written {
